@@ -1,0 +1,129 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "autoApprove": ["sequentialthinking"],
+      "disabled": false,
+      "timeout": 600,
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "codecompress": {
+      "disabled": false,
+      "type": "stdio",
+      "command": "codecompress-server",
+      "args": [
+        "--mcp",
+        "--yes",
+        "--no-cluster",
+        "--exclude",
+        "testes,docfx,bin,obj,node_modules,.git,.vs,packages,Migrations,Scripts,Backups,Resources,Properties,logs,wwwroot/lib,*.dll,*.exe,*.pdf,*.png,*.jpg,*.sql"
+      ],
+      "autoApprove": [
+        "expand_symbol", "assemble_context", "dependency_graph", "file_tree", 
+        "get_symbols", "project_outline", "get_symbol", "blast_radius", 
+        "topic_outline", "snapshot_create", "invalidate_cache", "list_repos", 
+        "search_text", "changes_since", "find_unused_symbols", "stop_server", 
+        "get_hot_path", "find_references", "get_module_api", "project_dependencies", 
+        "search_symbols", "index_project"
+      ],
+      "cwd": "C:\\curso",
+      "timeout": 300
+    },
+    "pg_curso": {
+      "autoApprove": [
+        "pg_list_schemas", "pg_describe_table", "pg_health", "pg_top_queries", 
+        "pg_unused_indexes", "pg_suggest_indexes", "pg_explain", "pg_table_indexes", 
+        "pg_table_size", "pg_stat_activity", "pg_settings", "pg_extension", 
+        "pg_list_roles", "pg_table_privileges", "pg_constraint_info", "pg_sequence_info", 
+        "pg_table_stats", "pg_database_size", "pg_blocking_locks", "pg_list_views", 
+        "pg_list_functions", "pg_list_extensions", "pg_search_columns", "pg_seq_scan_tables", 
+        "pg_inspect_locks", "pg_kill", "pg_replication_status", "pg_advisor", 
+        "pg_table_bloat", "pg_list_tables", "pg_readonly", "pg_query"
+      ],
+      "disabled": false,
+      "timeout": 60,
+      "type": "stdio",
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "@yawlabs/postgres-mcp@latest"],
+      "env": {
+        "DATABASE_URL": "postgresql://postgres:sql@localhost:5432/curso",
+        "ALLOW_WRITES": "1",
+        "PGSSLMODE": "disable"
+      }
+    },
+    "playwright": {
+      "autoApprove": [
+        "browser_close", "browser_resize", "browser_console_messages", "browser_handle_dialog", 
+        "browser_evaluate", "browser_file_upload", "browser_drop", "browser_fill_form", 
+        "browser_press_key", "browser_type", "browser_navigate_back", "browser_network_requests", 
+        "browser_network_request", "browser_run_code_unsafe", "browser_take_screenshot", 
+        "browser_snapshot", "browser_click", "browser_drag", "browser_hover", 
+        "browser_select_option", "browser_tabs", "browser_wait_for", "browser_navigate"
+      ],
+      "timeout": 60,
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp"]
+    },
+    "context7": {
+      "autoApprove": ["get-library-docs", "resolve-library-id", "query-docs"],
+      "timeout": 60,
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "windows-search": {
+      "autoApprove": ["search_windows", "replace_in_files", "read_lines", "fix_encoding", "fix_mojibake", "search_files"],
+      "timeout": 60,
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:/Users/SEU_USUARIO/.cline-mcps/windows-search/index.js"]
+    },
+    "dotnet-build": {
+      "autoApprove": ["cancel_build", "list_builds", "check_build"],
+      "disabled": false,
+      "timeout": 120,
+      "type": "stdio",
+      "command": "node",
+      "args": ["C:/Users/SEU_USUARIO/.cline-mcps/dotnet-build/index.js"]
+    },
+    "filesystem": {
+      "autoApprove": [
+        "read_file", "read_media_file", "read_multiple_files", "write_file", 
+        "edit_file", "create_directory", "list_directory_with_sizes", "directory_tree", 
+        "move_file", "get_file_info", "list_allowed_directories", "list_directory", 
+        "search_files", "read_text_file"
+      ],
+      "disabled": false,
+      "timeout": 60,
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y", "@modelcontextprotocol/server-filesystem",
+        "C:/curso/projeto_curso"
+      ]
+    },
+    "glider": {
+      "type": "stdio",
+      "command": "glider",
+      "args": ["--default-timeout", "10m", "--build-host", "netframework", "--verbose"],
+      "timeout": 600,
+      "autoApprove": [
+        "server_status", "sync", "reload", "unload", "resolve_symbol", 
+        "get_symbol_at_position", "find_references", "find_implementations", "find_callers", 
+        "get_outgoing_calls", "get_type_hierarchy", "get_derived_types", "get_symbol_info", 
+        "analyze_change_impact", "get_type_dependencies", "rename_symbol", "move_type", 
+        "move_member", "organize_usings", "format_document", "batch", "get_completion", 
+        "get_signature_help", "get_hover", "get_symbol_info_batch", "get_type_hierarchy_batch", 
+        "write_file", "find_unused_symbols", "find_external_dependency_usages", 
+        "get_project_format_summary", "get_structure", "get_cascade_impact", "view_external_definition", 
+        "find_unused_parameters", "find_member_in_hierarchy", "search_text", "get_project_graph", 
+        "get_type_source", "semantic_query", "find_unused_project_references", "find_package_usages", 
+        "analyze_complexity", "get_method_signature", "find_overrides", "diagnostic_hotspots", 
+        "get_file_contents", "expand_symbol", "get_symbol", "get_method_source", "load", 
+        "get_type_info", "get_diagnostics", "search_symbols", "find_code"
+      ]
+    }
+  }
+}
