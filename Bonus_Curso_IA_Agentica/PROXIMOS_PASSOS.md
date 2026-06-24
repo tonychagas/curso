@@ -1,4 +1,4 @@
-```markdown
+
 # 📌 Próximos Passos — Guia Definitivo: Do Zero ao Deploy com IA Agêntica
 
 ## Parabéns por adquirir o curso! 🎉
@@ -58,5 +58,6 @@ Agora que você tem acesso ao material, aqui está um roteiro claro para aprovei
 
 **Tony Chagas**  
 Engenheiro de Software | Especialista em Vibe Coding e IA Agêntica
-```
 
+
+---

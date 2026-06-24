@@ -1,4 +1,6 @@
-```markdown
+
+---
+
 # 🚀 Bônus Exclusivos | Guia Definitivo: Do Zero ao Deploy com IA Agêntica
 
 ## Bem-vindo ao Kit do Aluno de Elite! 🎁
@@ -41,6 +43,7 @@ Arquivo de configuração pronto para conectar o Cline ao PostgreSQL, arquivos e
 | `EXEMPLO_PROMPT_CAPITULO_4.md` | Veja um exemplo real de prompt do curso. |
 | `PROXIMOS_PASSOS.md` | Checklist do aluno após a compra. |
 | `COMPARATIVO_VIBE_CODING.md` | Entenda a diferença entre desenvolvimento tradicional e Vibe Coding. |
+| `TROUBLESHOOTING.md` | Guia de resolução de problemas para deploy e infraestrutura. |
 
 ---
 
@@ -165,5 +168,6 @@ Este material é de uso exclusivo para alunos do curso. Para mais informações,
 ---
 
 ⭐ **Se este repositório te ajudou, deixe uma estrela!** ⭐
-```
 
+
+---

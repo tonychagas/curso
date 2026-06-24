@@ -1,8 +1,9 @@
-```markdown
+
 ---
 author: Tony Chagas
 date: 2026-06-24
 version: 1.1
+
 ---
 
 # 🏗️ Curso ERP - Guia Consolidado de Desenvolvimento Total
@@ -106,7 +107,7 @@ version: 1.1
 > **Versão:** 1.1
 > **Última Atualização:** 2026-06-24
 > **Autor:** Tony Chagas
-```
+
 
 ---
 

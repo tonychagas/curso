@@ -1,4 +1,8 @@
-```markdown
+
+---
+
+## 📄 ARQUIVO: `EXEMPLO_PROMPT_CAPITULO_4.md`
+
 # 📌 Exemplo de Prompt - Capítulo 4: Plan-and-Review
 
 > Este é um exemplo real do nível de detalhe e qualidade que você vai encontrar no curso **"Guia Definitivo: Do Zero ao Deploy com IA Agêntica"**.
@@ -13,7 +17,7 @@ No curso, você aprende a nunca dar ordens complexas a um agente sem antes pedir
 
 ## 📥 Prompt de Alinhamento (Capítulo 4)
 
-> *"DIRETRIZ MESTRE DE SESSÃO: Leia o arquivo DEVELOPMENT.md na raiz C:\curso usando a ferramenta filesystem para absorver nossas regras de ouro de arquitetura. **NÃO crie ou altere nenhum arquivo C# ainda.** Esta é uma etapa estritamente de planejamento e alinhamento técnico.*
+> *"DIRETRIZ MESTRE DE SESSÃO: Leia o arquivo DEVELOPMENT.md na raiz C:\curso usando a ferramenta filesystem para absorver nossas regras de ouro de arquitetura.* **NÃO crie ou altere nenhum arquivo C# ainda.** *Esta é uma etapa estritamente de planejamento e alinhamento técnico.*
 >
 > *O DESAFIO: Precisamos modelar a camada de dados Multi-Tenant para o nosso ERP Blazor utilizando o EF Core 10 e PostgreSQL, centralizados diretamente na raiz C:\curso. O isolamento deve ser lógico por software com chave primária composta (TenantId, Id).*
 >
@@ -82,4 +86,5 @@ O **Capítulo 4** contém **10+ prompts como este**, além de:
 
 **Tony Chagas**  
 Engenheiro de Software | Especialista em Vibe Coding e IA Agêntica
-```
+
+---
