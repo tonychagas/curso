@@ -1,0 +1,161 @@
+# =============================================================================
+# .clineignore — Padrões para economia de tokens e segurança
+# Projeto: Hotline (Blazor + PostgreSQL)
+# =============================================================================
+# Cada seção abaixo lista padrões de arquivos/pastas que o Cline deve IGNORAR
+# ao ler o projeto. Isso economiza tokens (evitando arquivos grandes/irrelevantes)
+# e protege dados sensíveis.
+# =============================================================================
+
+
+# =============================================================================
+# BUILD / OUTPUT (bin, obj)
+# =============================================================================
+# Pastas geradas pelo compilador .NET. Contêm assemblies compilados, símbolos
+# de debug, e arquivos temporários. São completamente irrelevantes para análise
+# de código-fonte e podem consumir dezenas de milhares de tokens.
+bin/
+obj/
+
+
+# =============================================================================
+# BACKUPS DO BANCO DE DADOS (Backups/)
+# =============================================================================
+# Backups JSON do banco PostgreSQL. O arquivo carga_dados_hotline.json tem
+# ~6.3 MB — consumiria ~1.5 MILHÃO de tokens se lido. Totalmente irrelevante
+# para contexto de desenvolvimento/análise de código.
+Backups/
+
+
+# =============================================================================
+# SCRIPTS SQL AVULSOS (Scripts/)
+# =============================================================================
+# Scripts SQL manuais para operações pontuais no banco (ex: RBAC). Não fazem
+# parte do fluxo de desenvolvimento do código e são desnecessários para
+# análise do sistema.
+Scripts/
+*.sql
+
+# =============================================================================
+# ARQUIVOS DE CONFIGURAÇÃO COM DADOS SENSÍVEIS
+# =============================================================================
+# appsettings.json contém: senhas PostgreSQL, credenciais SMTP, chave de
+# criptografia, license key Syncfusion, secrets de API (Mercado Livre, Shopee).
+# appsettings.Development.json (se existir) também pode conter segredos locais.
+# NUNCA devem ser lidos pelo Cline por segurança.
+
+
+# =============================================================================
+# CONFIGURAÇÕES DE LAUNCH/DEBUG LOCAIS
+# =============================================================================
+# Configurações específicas da máquina do desenvolvedor (portas, variáveis de
+# ambiente, perfis de execução). Irrelevantes para análise de código.
+
+
+
+# =============================================================================
+# DOCUMENTAÇÃO EXTENSA (Docs/)
+# =============================================================================
+# Documentos de planejamento, análise, TODO lists, UI audit, etc. Embora úteis
+# para consulta humana, não são código-fonte e consomem tokens desnecessários
+# durante análise de código. Se precisar de contexto de docs, leia sob demanda.
+Docs/
+
+
+# =============================================================================
+# BIBLIOTECAS FRONTEND THIRD-PARTY (wwwroot/lib, wwwroot/Schemas)
+# =============================================================================
+# wwwroot/lib/bootstrap/ — Biblioteca CSS/JS do Bootstrap (third-party).
+# wwwroot/Schemas/ — 21 arquivos XSD de schemas fiscais da SEFAZ (~21 arquivos).
+# NÃO são código do projeto e não devem ser analisados.
+wwwroot/lib/
+wwwroot/Schemas/
+
+
+# =============================================================================
+# ARQUIVOS BINÁRIOS / NÃO-TEXTO
+# =============================================================================
+# Certificado digital .pfx (binário, ~9 KB). Arquivos de imagem, fontes, etc.
+# Não podem ser interpretados como texto e são irrelevantes para análise.
+*.pfx
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.woff
+*.woff2
+*.ttf
+*.eot
+*.pdf
+*.xml
+
+# =============================================================================
+# FERRAMENTAS / RELATÓRIOS AUXILIARES (tools/)
+# =============================================================================
+# Relatórios gerados por ferramentas de verificação (ex: encoding checker).
+# Não fazem parte do código-fonte do projeto.
+tools/
+
+# =============================================================================
+# DEPENDÊNCIAS (node_modules, packages)
+# =============================================================================
+# Caso o projeto venha a usar npm/yarn/pnpm no futuro. node_modules pode ter
+# dezenas de milhares de arquivos e consumir milhões de tokens.
+node_modules/
+packages/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+
+# =============================================================================
+# ARQUIVOS TEMPORÁRIOS DO VS CODE / IDE
+# =============================================================================
+# Configurações de workspace do VS Code, histórico de edições, arquivos de
+# usuário do Visual Studio. Específicos da máquina do desenvolvedor.
+.vs/
+.vscode/
+.agent/
+.history/
+*.user
+*.suo
+*.userprefs
+*.DotSettings
+*.DotSettings.user
+*.csproj.user
+build-temp/
+
+# =============================================================================
+# CONTROLE DE VERSÃO (.git/)
+# =============================================================================
+# Banco de dados Git. Nunca deve ser lido — contém o repositório inteiro
+# em formato binário. O Cline já tem acesso ao diff via git commands.
+.git/
+
+
+# =============================================================================
+# ARQUIVOS DE LOG
+# =============================================================================
+# Logs de execução, debug, Serilog, etc. Podem crescer muito e conter dados
+# sensíveis ou irrelevantes para análise de código.
+logs/
+*.log
+Logs/
+
+
+# =============================================================================
+# ARQUIVOS DE SISTEMA / OCULTOS DO WINDOWS
+# =============================================================================
+# Arquivos de sistema que não devem ser lidos.
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+
+# =============================================================================
+# ARQUIVOS DE RELATÓRIO / OUTPUT DE FERRAMENTAS
+# =============================================================================
+# Relatórios de análise, outputs de ferramentas, etc.
+*.report.json
+check_resx_encoding_report.json

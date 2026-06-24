@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # 🏢 Servidor de Banco de Dados PostgreSQL Seguro
+  postgres_db:
+    image: postgres:16-alpine
+    container_name: saas_postgres_prod
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-saas_admin}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-MudeEssaSenha123!}
+      POSTGRES_DB: ${DB_NAME:-saas_core_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata_prod:/var/lib/postgresql/data
+    networks:
+      - saas_network
+
+  # 🚀 Aplicação Web Blazor (.NET 10)
+  blazor_app:
+    image: saas-blazor-app:latest
+    container_name: saas_blazor_prod
+    restart: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+      - "8443:443"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ConnectionStrings__DefaultConnection=Host=postgres_db;Port=5432;Database=saas_core_db;Username=${DB_USER:-saas_admin};Password=${DB_PASSWORD:-MudeEssaSenha123!}
+    depends_on:
+      - postgres_db
+    networks:
+      - saas_network
+
+volumes:
+  pgdata_prod:
+    driver: local
+
+networks:
+  saas_network:
+    driver: bridge
