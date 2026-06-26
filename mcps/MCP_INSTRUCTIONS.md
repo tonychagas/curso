@@ -24,8 +24,6 @@ Antes de configurar os MCPs, certifique-se de que você tem:
 | Item | Status |
 | :--- | :---: |
 | Node.js instalado (para usar `npx`) | ☐ |
-| CodeCompress Server instalado globalmente (`npm install -g codecompress-server`) | ☐ |
-| Glider MCP instalado globalmente (`npm install -g glider-mcp`) | ☐ |
 
 ---
 
@@ -112,8 +110,8 @@ No chat do Cline, digite:
 | ✅ | Etapa | Status |
 | :---: | :--- | :---: |
 | □ | Instalou o Node.js (para npm) | _____ |
-| □ | Instalou o codecompress-server globalmente (`npm install -g codecompress-server`) | _____ |
-| □ | Instalou o glider-mcp globalmente (`npm install -g glider-mcp`) | _____ |
+| □ | Instalou o codecompress-server globalmente  | _____ |
+| □ | Instalou o glider-mcp globalmente  | _____ |
 | □ | Configurou o arquivo `cline_mcp_settings.json` | _____ |
 | □ | Substituiu `SEU_USUARIO` pelos caminhos corretos | _____ |
 | □ | Validou que todos os MCPs estão com status "Conectado" | _____ |

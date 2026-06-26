@@ -78,7 +78,7 @@
       "timeout": 60,
       "type": "stdio",
       "command": "node",
-      "args": ["C:/Users/SEU_USUARIO/.cline-mcps/windows-search/index.js"]
+      "args": ["C:/curso/ia-mcps/windows-search/index.js"]
     },
     "dotnet-build": {
       "autoApprove": ["cancel_build", "list_builds", "check_build"],
@@ -86,7 +86,7 @@
       "timeout": 120,
       "type": "stdio",
       "command": "node",
-      "args": ["C:/Users/SEU_USUARIO/.cline-mcps/dotnet-build/index.js"]
+      "args": ["C:/curso/ia-mcps/dotnet-build/index.js"]
     },
     "filesystem": {
       "autoApprove": [
@@ -101,7 +101,7 @@
       "command": "npx",
       "args": [
         "-y", "@modelcontextprotocol/server-filesystem",
-        "C:/curso/projeto_curso"
+        "C:/curso"
       ]
     },
     "glider": {
