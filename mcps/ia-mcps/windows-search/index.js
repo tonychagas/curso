@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 'use strict';
+
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
@@ -47,10 +48,22 @@ async function processQueue() {
 
   while (queue.length > 0) {
     const raw = queue.shift();
+    let currentId = null;
     try {
+      // Pré-parse rápido para tentar capturar o ID caso o handleLine quebre de forma catastrófica
+      try {
+        const parsed = JSON.parse(raw);
+        currentId = parsed?.id;
+      } catch {}
+
       await handleLine(raw);
     } catch (err) {
-      console.error(`[node-search] Erro não tratado: ${err?.stack || err}`);
+      console.error(`[node-search] Erro fatal na fila: ${err?.stack || err}`);
+      if (currentId !== null && currentId !== undefined) {
+        try {
+          writeError(currentId, -32603, `Internal error: ${err.message}`);
+        } catch {}
+      }
     }
   }
 
@@ -73,50 +86,43 @@ async function handleLine(raw) {
   const params = msg.params || {};
   const isNotification = id === undefined;
 
-  try {
-    if (method === 'initialize') {
-      writeResult(id, {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: { name: 'node-search', version: '5.2.0' }
-      });
-      return;
-    }
+  if (method === 'initialize') {
+    writeResult(id, {
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'node-search', version: '5.2.0' }
+    });
+    return;
+  }
 
-    if (method === 'notifications/initialized') return;
+  if (method === 'notifications/initialized') return;
 
-    if (method === 'tools/list') {
-      writeResult(id, { tools: TOOL_DEFINITIONS });
-      return;
-    }
+  if (method === 'tools/list') {
+    writeResult(id, { tools: TOOL_DEFINITIONS });
+    return;
+  }
 
-    if (method === 'tools/call') {
-      const toolName = params.name;
-      const toolArgs = params.arguments || {};
-      try {
-        if (toolName === 'search_files') await executeSearch(id, toolArgs);
-        else if (toolName === 'replace_in_files') await executeReplace(id, toolArgs);
-        else if (toolName === 'read_lines') await executeReadLines(id, toolArgs);
-        else if (toolName === 'fix_encoding') await executeFixEncoding(id, toolArgs);
-        else if (toolName === 'fix_mojibake') await executeFixMojibake(id, toolArgs);
-        else if (toolName === 'find_files') await executeFindFiles(id, toolArgs);
-        else if (toolName === 'get_file_info') await executeGetFileInfo(id, toolArgs);
-        else if (toolName === 'list_directory') await executeListDirectory(id, toolArgs);
-        else writeToolError(id, `Tool not found: ${toolName}`);
-      } catch (err) {
-        writeToolError(id, `Erro ao executar ${toolName}: ${err.message}`);
-      }
-      return;
+  if (method === 'tools/call') {
+    const toolName = params.name;
+    const toolArgs = params.arguments || {};
+    try {
+      if (toolName === 'search_files') await executeSearch(id, toolArgs);
+      else if (toolName === 'replace_in_files') await executeReplace(id, toolArgs);
+      else if (toolName === 'read_lines') await executeReadLines(id, toolArgs);
+      else if (toolName === 'fix_encoding') await executeFixEncoding(id, toolArgs);
+      else if (toolName === 'fix_mojibake') await executeFixMojibake(id, toolArgs);
+      else if (toolName === 'find_files') await executeFindFiles(id, toolArgs);
+      else if (toolName === 'get_file_info') await executeGetFileInfo(id, toolArgs);
+      else if (toolName === 'list_directory') await executeListDirectory(id, toolArgs);
+      else writeToolError(id, `Tool not found: ${toolName}`);
+    } catch (err) {
+      writeToolError(id, `Erro ao executar ${toolName}: ${err.message}`);
     }
+    return;
+  }
 
-    if (!isNotification) {
-      writeError(id, -32601, `Method not found: ${method}`);
-    }
-  } catch (err) {
-    console.error(`[node-search] FATAL: ${err.message}`);
-    if (!isNotification) {
-      writeError(id, -32603, `Internal error: ${err.message}`);
-    }
+  if (!isNotification) {
+    writeError(id, -32601, `Method not found: ${method}`);
   }
 }
 
@@ -280,7 +286,7 @@ const KNOWN_ENCODINGS = new Set([
   'utf-8', 'utf-16le', 'utf-16be', 'windows-1252', 'iso-8859-1', 'latin1', 'ascii'
 ]);
 
-// Cache de arquivos
+// Cache de arquivos (Otimizado para evitar alocações de arrays pesados)
 const fileCache = new Map();
 const MAX_CACHE_SIZE = 30;
 
@@ -292,9 +298,11 @@ async function getCachedFile(filePath, forceRead = false) {
   const buffer = await fs.promises.readFile(filePath);
   
   if (fileCache.size >= MAX_CACHE_SIZE) {
-    const entries = Array.from(fileCache.entries());
-    for (let i = 0; i < 10 && i < entries.length; i++) {
-      fileCache.delete(entries[i][0]);
+    const iterator = fileCache.keys();
+    for (let i = 0; i < 10; i++) {
+      const nextKey = iterator.next().value;
+      if (!nextKey) break;
+      fileCache.delete(nextKey);
     }
   }
   
@@ -371,12 +379,10 @@ async function walk(dir, fileExts, excludeExts, onFileFound) {
         await walk(fullPath, fileExts, excludeExts, onFileFound);
       }
     } else if (dirent.isFile()) {
-      // Verifica extensões permitidas
       let matchesExt = true;
       if (fileExts && fileExts.length > 0) {
         matchesExt = fileExts.some(ext => dirent.name.endsWith(ext));
       }
-      // Verifica extensões excluídas
       let excluded = false;
       if (excludeExts && excludeExts.length > 0) {
         excluded = excludeExts.some(ext => dirent.name.endsWith(ext));
@@ -437,6 +443,10 @@ function detectEol(text) {
 
 function normalizeEol(text) {
   return text.replace(/\r\n|\r/g, '\n');
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function buildDiffPreview(original, updated, maxLines = 15) {
@@ -512,30 +522,18 @@ function sendProgress(id, current, total, message) {
   process.stdout.write(JSON.stringify({
     jsonrpc: '2.0',
     method: 'notifications/progress',
-    params: {
-      id,
-      current,
-      total,
-      message
-    }
+    params: { id, current, total, message }
   }) + '\n');
 }
 
-function parsePatterns(patternStr, simpleMatch, caseSensitive) {
+// Compila múltiplos padrões em uma Regex ÚNICA combinada para performance massiva no V8
+function parsePatternsToSingleRegex(patternStr, simpleMatch, caseSensitive) {
   const patterns = patternStr.split('||').map(p => p.trim()).filter(Boolean);
-  
   if (patterns.length === 0) {
     throw new Error('Nenhum padrão válido');
   }
-  
-  return patterns.map(p => {
-    if (simpleMatch) {
-      const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      return new RegExp(escaped, caseSensitive ? '' : 'i');
-    } else {
-      return new RegExp(p, caseSensitive ? '' : 'i');
-    }
-  });
+  const unified = patterns.map(p => simpleMatch ? escapeRegex(p) : p).join('|');
+  return new RegExp(unified, caseSensitive ? '' : 'i');
 }
 
 // =============================================================================
@@ -587,9 +585,9 @@ async function executeSearch(id, args) {
   const maxResults = Math.min(args.maxResults ?? 500, 2000);
   const concurrency = Math.min(Math.max(args.concurrency || 8, 1), 32);
 
-  let regexes;
+  let combinedRegex;
   try {
-    regexes = parsePatterns(patternStr, simpleMatch, caseSensitive);
+    combinedRegex = parsePatternsToSingleRegex(patternStr, simpleMatch, caseSensitive);
   } catch (err) {
     return writeToolError(id, `Erro no padrão: ${err.message}`);
   }
@@ -623,15 +621,7 @@ async function executeSearch(id, args) {
       lineNum++;
       const trimmed = truncateLine(rawLine.trim());
       
-      let foundMatch = false;
-      for (const regex of regexes) {
-        if (regex.test(rawLine)) {
-          foundMatch = true;
-          break;
-        }
-      }
-
-      if (foundMatch) {
+      if (combinedRegex.test(rawLine)) {
         if (totalFound >= maxResults) {
           isTruncated = true;
           break;
@@ -727,8 +717,7 @@ async function executeReplace(id, args) {
   let regex;
   try {
     if (simpleMatch) {
-      const escaped = patternStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      regex = new RegExp(escaped, caseSensitive ? 'g' : 'gi');
+      regex = new RegExp(escapeRegex(patternStr), caseSensitive ? 'g' : 'gi');
     } else {
       regex = new RegExp(patternStr, caseSensitive ? 'g' : 'gi');
     }
@@ -743,6 +732,7 @@ async function executeReplace(id, args) {
 
   const analyzed = new Array(fileList.length);
   let processed = 0;
+  
   await runPool(fileList, concurrency, async (filePath, i) => {
     if (processed >= maxFiles) return;
     if (await isLikelyBinary(filePath)) return;
@@ -775,30 +765,38 @@ async function executeReplace(id, args) {
     });
   }
 
-  const writeReport = [];
+  const writeReport = new Array(changes.length);
   let abortedByBackup = false;
+
+  // Escrita física e geração de backups otimizados em paralelo com runPool
   if (!dryRun) {
-    for (const c of changes) {
+    await runPool(changes, concurrency, async (changeItem, index) => {
       if (shuttingDown) {
-        writeReport.push(`${c.filePath}: SKIPPED (shutdown em andamento)`);
-        continue;
+        writeReport[index] = `${changeItem.filePath}: SKIPPED (shutdown em andamento)`;
+        return;
       }
+      if (abortedByBackup) {
+        writeReport[index] = `${changeItem.filePath}: SKIPPED (abortado por falha anterior)`;
+        return;
+      }
+
       if (backup) {
-        const result = await writeBackup(c.filePath, c.originalBuffer);
+        const result = await writeBackup(changeItem.filePath, changeItem.originalBuffer);
         if (!result.ok) {
-          writeReport.push(`${c.filePath}: ABORT (backup falhou: ${result.error.message})`);
+          writeReport[index] = `${changeItem.filePath}: ABORT (backup falhou: ${result.error.message})`;
           abortedByBackup = true;
-          break;
+          return;
         }
-        c.bakPath = result.bakPath;
+        changeItem.bakPath = result.bakPath;
       }
+
       try {
-        await fs.promises.writeFile(c.filePath, c.updated, 'utf8');
-        writeReport.push(c.bakPath ? `${c.filePath} (backup: ${path.basename(c.bakPath)})` : c.filePath);
+        await fs.promises.writeFile(changeItem.filePath, changeItem.updated, 'utf8');
+        writeReport[index] = changeItem.bakPath ? `${changeItem.filePath} (backup: ${path.basename(changeItem.bakPath)})` : changeItem.filePath;
       } catch (err) {
-        writeReport.push(`${c.filePath}: ERRO (${err.message})`);
+        writeReport[index] = `${changeItem.filePath}: ERRO (${err.message})`;
       }
-    }
+    });
   }
 
   const totalMatches = changes.reduce((sum, c) => sum + c.matchCount, 0);
@@ -808,7 +806,7 @@ async function executeReplace(id, args) {
   if (dryRun) {
     summary = `\n\n_(Modo dryRun — nenhum arquivo foi alterado. Rode novamente com dryRun:false para aplicar.)_`;
   } else if (abortedByBackup) {
-    summary = `\n\n⚠️ Escrita ABORTADA por falha de backup. Arquivos modificados ANTES da falha foram mantidos; os RESTANTES não foram alterados. Verifique o log abaixo.`;
+    summary = `\n\n⚠️ Escrita PARCIALMENTE ABORTADA por falha de backup. Verifique o log abaixo.`;
   } else {
     summary = `\n\n${changes.length} arquivo(s) modificado(s), ${totalMatches} ocorrência(s) substituída(s) no total.${backup ? ' Backups .bak.[timestamp] criados.' : ''}`;
   }
@@ -816,7 +814,7 @@ async function executeReplace(id, args) {
   writeResult(id, {
     content: [{
       type: 'text',
-      text: `${changes.length} arquivo(s) com ocorrências de "${patternStr}" (${totalMatches} no total):\n\n${blocks.join('\n\n')}${summary}${writeReport.length ? `\n\nLog de escrita:\n${writeReport.join('\n')}` : ''}`
+      text: `${changes.length} arquivo(s) com ocorrências de "${patternStr}" (${totalMatches} no total):\n\n${blocks.join('\n\n')}${summary}${writeReport.length ? `\n\nLog de escrita:\n${writeReport.filter(Boolean).join('\n')}` : ''}`
     }]
   });
 }
@@ -897,8 +895,7 @@ async function executeReadLines(id, args) {
       }
       if (lineNum >= endLine) {
         hitUpperBound = true;
-        rlFile.close();
-        fileStream.destroy();
+        rlFile.close(); // Fecha com segurança a interface de leitura e libera o arquivo
         break;
       }
     }
@@ -914,9 +911,7 @@ async function executeReadLines(id, args) {
   }
 
   const endLineShown = Math.min(endLine, lineNum);
-  const totalText = hitUpperBound
-    ? `${endLine}+ (arquivo continua além)`
-    : `${lineNum} total`;
+  const totalText = hitUpperBound ? `${endLine}+ (arquivo continua além)` : `${lineNum} total`;
   const encodingNote = encoding !== 'utf-8' ? `\n\n_(Aviso: arquivo lido como ${encoding})_` : '';
 
   writeResult(id, {
@@ -997,9 +992,7 @@ async function executeFixEncoding(id, args) {
     });
   }
 
-  const summary = dryRun
-    ? `\n\n_(Modo dryRun — nenhum arquivo foi alterado.)_`
-    : `\n\n${report.length} arquivo(s) convertido(s) para UTF-8.`;
+  const summary = dryRun ? `\n\n_(Modo dryRun — nenhum arquivo foi alterado.)_` : `\n\n${report.length} arquivo(s) convertido(s) para UTF-8.`;
 
   writeResult(id, {
     content: [{
@@ -1077,9 +1070,7 @@ async function executeFixMojibake(id, args) {
     });
   }
 
-  const summary = dryRun
-    ? `\n\n_(Modo dryRun — nenhum arquivo foi alterado.)_`
-    : `\n\n${report.length} arquivo(s) corrigido(s).`;
+  const summary = dryRun ? `\n\n_(Modo dryRun — nenhum arquivo foi alterado.)_` : `\n\n${report.length} arquivo(s) corrigido(s).`;
 
   writeResult(id, {
     content: [{
@@ -1090,7 +1081,7 @@ async function executeFixMojibake(id, args) {
 }
 
 // =============================================================================
-// TOOL: find_files - Busca arquivos por nome
+// TOOL: find_files
 // =============================================================================
 
 async function executeFindFiles(id, args) {
@@ -1104,18 +1095,9 @@ async function executeFindFiles(id, args) {
   }
   
   const results = [];
-  
-  // Converte wildcard para regex
-  let regexPattern = pattern
-    .replace(/\./g, '\\.')
-    .replace(/\*/g, '.*')
-    .replace(/\?/g, '.');
-  
-  // Se não tem wildcard, busca literal
+  let regexPattern = pattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.');
   const hasWildcard = pattern.includes('*') || pattern.includes('?');
-  const searchRegex = hasWildcard 
-    ? new RegExp(`^${regexPattern}$`, caseSensitive ? '' : 'i')
-    : null;
+  const searchRegex = hasWildcard ? new RegExp(`^${regexPattern}$`, caseSensitive ? '' : 'i') : null;
   
   async function walkFind(dir) {
     let dirents;
@@ -1154,7 +1136,6 @@ async function executeFindFiles(id, args) {
   
   try {
     await walkFind(searchPath);
-    
     if (results.length === 0) {
       return writeResult(id, {
         content: [{ type: 'text', text: `Nenhum arquivo encontrado com padrão "${pattern}" em ${searchPath}` }]
@@ -1164,16 +1145,14 @@ async function executeFindFiles(id, args) {
     const truncated = results.length >= maxResults;
     const text = `Encontrados ${results.length} arquivo(s):\n\n${results.join('\n')}${truncated ? `\n\n_(Truncado em ${maxResults} resultados)_` : ''}`;
     
-    writeResult(id, {
-      content: [{ type: 'text', text }]
-    });
+    writeResult(id, { content: [{ type: 'text', text }] });
   } catch (err) {
     writeToolError(id, `Erro na busca: ${err.message}`);
   }
 }
 
 // =============================================================================
-// TOOL: get_file_info - Informações do arquivo
+// TOOL: get_file_info
 // =============================================================================
 
 async function executeGetFileInfo(id, args) {
@@ -1207,7 +1186,6 @@ async function executeGetFileInfo(id, args) {
       info.contentLength = text.length;
       info.preview = text.slice(0, 500) + (text.length > 500 ? '...' : '');
       
-      // Detecta se tem mojibake
       const suspicious = countSuspicious(text);
       if (suspicious > 0) {
         info.mojibakeDetected = suspicious;
@@ -1220,19 +1198,14 @@ async function executeGetFileInfo(id, args) {
       }
     }
     
-    writeResult(id, {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(info, null, 2)
-      }]
-    });
+    writeResult(id, { content: [{ type: 'text', text: JSON.stringify(info, null, 2) }] });
   } catch (err) {
     writeToolError(id, `Erro ao ler arquivo: ${err.message}`);
   }
 }
 
 // =============================================================================
-// TOOL: list_directory - Lista estrutura de diretórios
+// TOOL: list_directory
 // =============================================================================
 
 async function executeListDirectory(id, args) {
@@ -1281,26 +1254,18 @@ async function executeListDirectory(id, args) {
   
   try {
     const items = await walkDir(searchPath);
-    
     if (items.length === 0) {
-      return writeResult(id, {
-        content: [{ type: 'text', text: `📂 ${searchPath}\n\n(Diretório vazio)` }]
-      });
+      return writeResult(id, { content: [{ type: 'text', text: `📂 ${searchPath}\n\n(Diretório vazio)` }] });
     }
     
-    writeResult(id, {
-      content: [{
-        type: 'text',
-        text: `📂 ${searchPath}\n\n${items.join('\n')}`
-      }]
-    });
+    writeResult(id, { content: [{ type: 'text', text: `📂 ${searchPath}\n\n${items.join('\n')}` }] });
   } catch (err) {
     writeToolError(id, `Erro ao listar diretório: ${err.message}`);
   }
 }
 
 // =============================================================================
-// UTILITÁRIOS DE ESCRITA DE PROTOCOLO
+// PROTOCOL WRITERS
 // =============================================================================
 
 function writeResult(id, result) {
