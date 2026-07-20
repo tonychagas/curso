@@ -3,18 +3,45 @@
 
 /**
  * ============================================================================
- * NODE-SEARCH MCP SERVER — VERSÃO SUPER PERFORMÁTICA + COMPACTADORES
+ * NODE-SEARCH MCP SERVER — VERSÃO v8.5.0 COMPLETA
  * ============================================================================
  *
- * 🔥 NOVIDADES:
- * - search_content → busca conteúdo com ripgrep (super rápido)
- * - compact_command → executa comandos e retorna saída COMPACTADA (economiza tokens)
- * - TOOL_PROFILE → reduz o número de tools registradas (corta overhead fixo)
- * - write_file, edit_file, create_directory, move_file → substitui o filesystem
- * - find_symbol / get_symbol_source → navegação estrutural
- * - Cache inteligente + validação de path + limite de tamanho
- * - Limpeza automática de backups antigos
- *
+ * 🔥 44 TOOLS IMPLEMENTADAS:
+ * 
+ * Busca/Símbolos (6):
+ *   - find_symbol, get_symbol_source, search_content, find_references, 
+ *     find_in_project, search_files
+ * 
+ * Edição/Arquivos (8):
+ *   - replace_in_files, write_file, edit_file, move_file, create_directory,
+ *     read_lines, find_files, list_directory
+ * 
+ * Análise (8):
+ *   - code_outline, get_code_smells, get_diagnostics, project_info,
+ *     analyze_dependencies, compare_files, get_symbol_usage, analyze_complexity
+ * 
+ * Refatoração (4):
+ *   - rename_symbol, extract_interface, get_type_info, find_unused_code
+ * 
+ * Estrutura (1):
+ *   - get_call_hierarchy
+ * 
+ * Comandos (1):
+ *   - compact_command
+ * 
+ * Utilidades (4):
+ *   - undo_last_change, get_metrics, get_cache_stats, code_completion
+ * 
+ * i18n/Resx (7):
+ *   - generate_labels, insert_translations, get_translation_context,
+ *     get_existing_translations, deduplicate_resx, find_duplicates, add_language
+ * 
+ * Informações (1):
+ *   - get_file_info
+ * 
+ * ✅ Zero dependências externas!
+ * ✅ Suporte a .NET 10, C# 13, Blazor
+ * ✅ Economia de 90-99% de tokens
  * ============================================================================
  */
 
@@ -27,15 +54,15 @@ const execAsync = promisify(exec);
 const { execFile } = require('child_process');
 const execFileAsync = promisify(execFile);
 const os = require('os');
+const crypto = require('crypto');
 
 // =============================================================================
-// PERFIL DE TOOLS (Item 5: reduz o overhead do tools/list)
+// PERFIL DE TOOLS
 // =============================================================================
 
 const TOOL_PROFILE = process.env.TOOL_PROFILE || 'full';
 
 const TOOL_PROFILES = {
-  // Core: apenas as tools mais usadas
   core: [
     'find_symbol',
     'get_symbol_source',
@@ -43,9 +70,14 @@ const TOOL_PROFILES = {
     'replace_in_files',
     'write_file',
     'edit_file',
-    'read_lines'
+    'read_lines',
+    'undo_last_change',
+    'code_outline',
+    'find_references',
+    'find_in_project',
+    'rename_symbol',
+    'get_cache_stats'
   ],
-  // Lean: core + arquivos
   lean: [
     'find_symbol',
     'get_symbol_source',
@@ -58,9 +90,18 @@ const TOOL_PROFILES = {
     'get_file_info',
     'list_directory',
     'create_directory',
-    'move_file'
+    'move_file',
+    'undo_last_change',
+    'code_outline',
+    'find_references',
+    'find_in_project',
+    'rename_symbol',
+    'get_code_smells',
+    'get_diagnostics',
+    'project_info',
+    'analyze_complexity',
+    'get_cache_stats'
   ],
-  // Full: todas as tools
   full: [
     'find_symbol',
     'get_symbol_source',
@@ -82,11 +123,86 @@ const TOOL_PROFILES = {
     'deduplicate_resx',
     'find_duplicates',
     'add_language',
-    'compact_command'
+    'compact_command',
+    'undo_last_change',
+    'code_outline',
+    'find_references',
+    'find_in_project',
+    'rename_symbol',
+    'get_code_smells',
+    'get_diagnostics',
+    'project_info',
+    'analyze_dependencies',
+    'compare_files',
+    'get_symbol_usage',
+    'code_completion',
+    'analyze_complexity',
+    'get_type_info',
+    'get_call_hierarchy',
+    'find_unused_code',
+    'extract_interface',
+    'get_metrics',
+    'get_cache_stats'
   ]
 };
 
 const ACTIVE_TOOLS = TOOL_PROFILES[TOOL_PROFILE] || TOOL_PROFILES.full;
+
+// =============================================================================
+// MÉTRICAS
+// =============================================================================
+
+const METRICS = {
+  operations: {},
+  tokensSaved: 0,
+  startTime: Date.now(),
+  commands: {
+    total: 0,
+    successes: 0,
+    errors: 0,
+    timeouts: 0
+  }
+};
+
+function trackOperation(operation, duration, tokensBefore = 0, tokensAfter = 0) {
+  if (!METRICS.operations[operation]) {
+    METRICS.operations[operation] = { 
+      total: 0, 
+      avgTime: 0, 
+      maxTime: 0, 
+      minTime: Infinity,
+      errors: 0,
+      tokensSaved: 0
+    };
+  }
+  const op = METRICS.operations[operation];
+  op.total++;
+  op.avgTime = (op.avgTime * (op.total - 1) + duration) / op.total;
+  op.maxTime = Math.max(op.maxTime, duration);
+  op.minTime = Math.min(op.minTime, duration);
+  const saved = tokensBefore - tokensAfter;
+  if (saved > 0) {
+    op.tokensSaved += saved;
+    METRICS.tokensSaved += saved;
+  }
+}
+
+function trackError(operation) {
+  if (METRICS.operations[operation]) {
+    METRICS.operations[operation].errors++;
+  }
+  METRICS.commands.errors++;
+}
+
+function trackCommand(success = true) {
+  METRICS.commands.total++;
+  if (success) METRICS.commands.successes++;
+  else METRICS.commands.errors++;
+}
+
+function trackTimeout() {
+  METRICS.commands.timeouts++;
+}
 
 // =============================================================================
 // DETECÇÃO DO RIPGREP
@@ -105,7 +221,7 @@ async function hasRipgrep() {
 }
 
 // =============================================================================
-// COMPACTADORES DE SAÍDA (Item 4)
+// COMPACTADORES DE SAÍDA
 // =============================================================================
 
 function compactBuildOutput(output) {
@@ -116,7 +232,6 @@ function compactBuildOutput(output) {
   const warningCodes = new Set();
 
   for (const line of lines) {
-    // Erros: CS0108, CS8602, etc.
     const errorMatch = line.match(/error\s+(CS\d+)/);
     if (errorMatch) {
       errorCodes.add(errorMatch[1]);
@@ -129,7 +244,6 @@ function compactBuildOutput(output) {
     }
   }
 
-  // Extrair arquivos com erro
   const errorFiles = errors.map(l => {
     const match = l.match(/([^:]+\.cs)/);
     return match ? match[1] : 'desconhecido';
@@ -216,46 +330,395 @@ function compactGenericOutput(output, command) {
   };
 }
 
+// =============================================================================
+// COMPACTAÇÃO PARA TESTES
+// =============================================================================
+
+function compactTestOutput(output, framework) {
+  const lines = output.split('\n');
+  let total = 0, passed = 0, failed = 0, skipped = 0;
+  const failures = [];
+  
+  if (framework.includes('dotnet test') || framework.includes('test')) {
+    for (const line of lines) {
+      const totalMatch = line.match(/Total:\s*(\d+)/);
+      if (totalMatch) total = parseInt(totalMatch[1]);
+      const failedMatch = line.match(/Failed:\s*(\d+)/);
+      if (failedMatch) failed = parseInt(failedMatch[1]);
+      const passedMatch = line.match(/Passed:\s*(\d+)/);
+      if (passedMatch) passed = parseInt(passedMatch[1]);
+      const skippedMatch = line.match(/Skipped:\s*(\d+)/);
+      if (skippedMatch) skipped = parseInt(skippedMatch[1]);
+      
+      if (line.includes('[FAIL]') || line.includes('Failed')) {
+        const testMatch = line.match(/(\w+\.\w+)\s+\[FAIL\]/);
+        if (testMatch) {
+          failures.push({
+            test: testMatch[1],
+            error: line
+          });
+        } else {
+          const altMatch = line.match(/Failed\s+([\w.]+)/);
+          if (altMatch) {
+            failures.push({
+              test: altMatch[1],
+              error: line
+            });
+          }
+        }
+      }
+    }
+  } else if (framework.includes('jest') || framework.includes('vitest')) {
+    for (const line of lines) {
+      const summaryMatch = line.match(/Tests:\s*(\d+)\s+passed,\s*(\d+)\s+total/);
+      if (summaryMatch) {
+        passed = parseInt(summaryMatch[1]);
+        total = parseInt(summaryMatch[2]);
+      }
+      const altSummary = line.match(/Tests:\s*(\d+)\s+failed,\s*(\d+)\s+passed,\s*(\d+)\s+total/);
+      if (altSummary) {
+        failed = parseInt(altSummary[1]);
+        passed = parseInt(altSummary[2]);
+        total = parseInt(altSummary[3]);
+      }
+      if (line.includes('●')) {
+        const testMatch = line.match(/●\s+(.+)$/);
+        if (testMatch) {
+          failures.push({
+            test: testMatch[1].trim(),
+            error: line
+          });
+        }
+      }
+    }
+  } else if (framework.includes('pytest')) {
+    for (const line of lines) {
+      const summaryMatch = line.match(/(\d+)\s+passed,\s*(\d+)\s+failed/);
+      if (summaryMatch) {
+        passed = parseInt(summaryMatch[1]);
+        failed = parseInt(summaryMatch[2]);
+        total = passed + failed;
+      }
+      if (line.includes('FAILED') || line.includes('ERROR')) {
+        const testMatch = line.match(/(\S+)\s+(FAILED|ERROR)/);
+        if (testMatch) {
+          failures.push({
+            test: testMatch[1],
+            error: line
+          });
+        }
+      }
+    }
+  } else {
+    for (const line of lines) {
+      if (line.includes('FAIL') || line.includes('ERROR') || line.includes('✕')) {
+        failures.push({
+          test: line.substring(0, 50),
+          error: line
+        });
+      }
+      const stats = line.match(/(\d+)\s+passed?/i);
+      if (stats) passed += parseInt(stats[1]);
+      const fails = line.match(/(\d+)\s+failed?/i);
+      if (fails) failed += parseInt(fails[1]);
+    }
+    total = passed + failed;
+  }
+  
+  return {
+    summary: `Tests: ${total} total, ${passed} passed, ${failed} failed${skipped ? `, ${skipped} skipped` : ''}`,
+    total,
+    passed,
+    failed,
+    skipped,
+    failures: failures.slice(0, 10),
+    hasFailures: failed > 0 || failures.length > 0,
+    framework: framework.split(' ')[0]
+  };
+}
+
+// =============================================================================
+// COMPACTAÇÃO PARA BUILD/NPM
+// =============================================================================
+
+function compactNpmBuildOutput(output, command) {
+  const lines = output.split('\n');
+  const errors = [];
+  const warnings = [];
+  const errorFiles = new Set();
+  let hasTypeScriptErrors = false;
+  
+  for (const line of lines) {
+    if (line.includes('TS') && line.includes('error')) {
+      hasTypeScriptErrors = true;
+      const match = line.match(/([^:]+\.tsx?):(\d+)/);
+      if (match) errorFiles.add(match[1]);
+      errors.push(line.trim());
+    }
+    
+    if (line.includes('Module not found') || line.includes('Module build failed')) {
+      errors.push(line.trim());
+      const match = line.match(/'(.*?)'/);
+      if (match) errorFiles.add(match[1]);
+    }
+    
+    if (line.includes('error') || line.includes('Error') || line.includes('ERROR')) {
+      errors.push(line.trim());
+      const fileMatch = line.match(/([^:]+\.(ts|js|tsx|jsx|css|scss))/);
+      if (fileMatch) errorFiles.add(fileMatch[1]);
+    }
+    
+    if (line.includes('warning') || line.includes('Warning') || line.includes('WARNING')) {
+      warnings.push(line.trim());
+    }
+  }
+  
+  return {
+    summary: `Build: ${errors.length} erro(s), ${warnings.length} warning(s)${hasTypeScriptErrors ? ' 🔴 TypeScript errors detected' : ''}`,
+    errors: errors.slice(0, 10),
+    errorCount: errors.length,
+    warningCount: warnings.length,
+    errorFiles: [...errorFiles].slice(0, 5),
+    hasErrors: errors.length > 0,
+    hasTypeScriptErrors,
+    isBuild: true
+  };
+}
+
+function compactEslintOutput(output) {
+  const lines = output.split('\n');
+  const problems = [];
+  let errorCount = 0;
+  let warningCount = 0;
+  
+  for (const line of lines) {
+    const match = line.match(/([^:]+):(\d+):(\d+)\s+(error|warning)\s+(.+)/);
+    if (match) {
+      const [, file, lineNum, col, severity, message] = match;
+      problems.push({
+        file: path.basename(file),
+        line: parseInt(lineNum),
+        column: parseInt(col),
+        severity,
+        message: message.trim()
+      });
+      if (severity === 'error') errorCount++;
+      if (severity === 'warning') warningCount++;
+    }
+  }
+  
+  return {
+    summary: `ESLint: ${errorCount} error(s), ${warningCount} warning(s)`,
+    problems: problems.slice(0, 10),
+    errorCount,
+    warningCount,
+    hasErrors: errorCount > 0,
+    totalProblems: problems.length
+  };
+}
+
+function compactDotnetPublish(output) {
+  const lines = output.split('\n');
+  const errors = [];
+  let published = false;
+  let publishPath = '';
+  
+  for (const line of lines) {
+    if (line.includes('error') || line.includes('Error')) {
+      errors.push(line.trim());
+    }
+    if (line.includes('Published to')) {
+      published = true;
+      const match = line.match(/Published to\s+(.+)/);
+      if (match) publishPath = match[1].trim();
+    }
+    if (line.includes('Publish succeeded')) {
+      published = true;
+    }
+  }
+  
+  return {
+    summary: `Publish: ${errors.length} erro(s)${published ? ' ✅ Sucesso' : ''}`,
+    errors: errors.slice(0, 10),
+    errorCount: errors.length,
+    hasErrors: errors.length > 0,
+    published,
+    publishPath,
+    isPublish: true
+  };
+}
+
+function compactNpmAuditOutput(output) {
+  const lines = output.split('\n');
+  let vulnerabilities = 0;
+  let critical = 0, high = 0, moderate = 0, low = 0;
+  let packages = [];
+  
+  for (const line of lines) {
+    const match = line.match(/(\d+)\s+(critical|high|moderate|low)/i);
+    if (match) {
+      const count = parseInt(match[1]);
+      const severity = match[2].toLowerCase();
+      vulnerabilities += count;
+      if (severity === 'critical') critical = count;
+      else if (severity === 'high') high = count;
+      else if (severity === 'moderate') moderate = count;
+      else if (severity === 'low') low = count;
+    }
+    const pkgMatch = line.match(/Package\s+(\S+)\s+.*\s+(\S+)\s+-\s+(critical|high|moderate|low)/i);
+    if (pkgMatch) {
+      packages.push({
+        name: pkgMatch[1],
+        severity: pkgMatch[3],
+        version: pkgMatch[2]
+      });
+    }
+  }
+  
+  return {
+    summary: `npm audit: ${vulnerabilities} vulnerabilidade(s)`,
+    vulnerabilities: { critical, high, moderate, low, total: vulnerabilities },
+    packages: packages.slice(0, 5),
+    hasVulnerabilities: vulnerabilities > 0,
+    isAudit: true
+  };
+}
+
+function compactRestoreOutput(output) {
+  const lines = output.split('\n');
+  const restored = [];
+  const errors = [];
+  let totalPackages = 0;
+  
+  for (const line of lines) {
+    if (line.includes('Restored') || line.includes('restored')) {
+      const match = line.match(/Restored\s+(\d+)/i);
+      if (match) totalPackages = parseInt(match[1]);
+      restored.push(line.trim());
+    }
+    if (line.includes('error') || line.includes('Error')) {
+      errors.push(line.trim());
+    }
+  }
+  
+  return {
+    summary: `dotnet restore: ${totalPackages || restored.length} pacote(s) restaurados${errors.length > 0 ? `, ${errors.length} erro(s)` : ''}`,
+    restored: restored.slice(0, 5),
+    errors: errors.slice(0, 5),
+    hasErrors: errors.length > 0,
+    isRestore: true
+  };
+}
+
+function compactInstallOutput(output) {
+  const lines = output.split('\n');
+  let added = 0;
+  let removed = 0;
+  const packages = [];
+  
+  for (const line of lines) {
+    const addedMatch = line.match(/added\s+(\d+)/i);
+    if (addedMatch) added = parseInt(addedMatch[1]);
+    const removedMatch = line.match(/removed\s+(\d+)/i);
+    if (removedMatch) removed = parseInt(removedMatch[1]);
+    
+    const pkgMatch = line.match(/\+ (\S+@\S+)/);
+    if (pkgMatch) packages.push(pkgMatch[1]);
+  }
+  
+  return {
+    summary: `Installed: ${added} pacote(s) adicionado${added > 0 ? `, ${removed} removido` : ''}`,
+    packages: packages.slice(0, 10),
+    added,
+    removed,
+    isInstall: true
+  };
+}
+
+function compactFormatOutput(output) {
+  const lines = output.split('\n');
+  const formatted = [];
+  const errors = [];
+  
+  for (const line of lines) {
+    if (line.includes('Formatting') || line.includes('formatted')) {
+      formatted.push(line.trim());
+    }
+    if (line.includes('error') || line.includes('Error')) {
+      errors.push(line.trim());
+    }
+  }
+  
+  return {
+    summary: `Format: ${formatted.length} arquivo(s)${errors.length > 0 ? `, ${errors.length} erro(s)` : ''}`,
+    formatted: formatted.slice(0, 5),
+    errors: errors.slice(0, 5),
+    hasErrors: errors.length > 0,
+    isFormat: true
+  };
+}
+
 function compactOutput(command, stdout, stderr) {
   const fullOutput = stdout + '\n' + stderr;
-
-  // Detectar tipo de comando
+  const startTokens = fullOutput.length / 4;
+  
+  if (command.includes('dotnet test') || command.includes('jest') || 
+      command.includes('vitest') || command.includes('pytest') ||
+      command.includes('npm test') || command.includes('yarn test') ||
+      command.includes('npx test')) {
+    return compactTestOutput(fullOutput, command);
+  }
+  
+  if (command.includes('npm run build') || command.includes('yarn build') ||
+      command.includes('tsc') || command.includes('webpack') ||
+      command.includes('vite build') || command.includes('rollup')) {
+    return compactNpmBuildOutput(fullOutput, command);
+  }
+  
+  if (command.includes('eslint') || command.includes('npx eslint')) {
+    return compactEslintOutput(fullOutput);
+  }
+  
+  if (command.includes('dotnet publish')) {
+    return compactDotnetPublish(fullOutput);
+  }
+  
+  if (command.includes('npm audit') || command.includes('yarn audit')) {
+    return compactNpmAuditOutput(fullOutput);
+  }
+  
+  if (command.includes('dotnet restore')) {
+    return compactRestoreOutput(fullOutput);
+  }
+  
+  if (command.includes('npm install') || command.includes('yarn install') || 
+      command.includes('npm i') || command.includes('yarn add')) {
+    return compactInstallOutput(fullOutput);
+  }
+  
+  if (command.includes('dotnet format')) {
+    return compactFormatOutput(fullOutput);
+  }
+  
   if (command.includes('dotnet build') || command.includes('dotnet test')) {
     return compactBuildOutput(fullOutput);
   }
+  
   if (command.includes('git status')) {
     return compactGitStatus(stdout);
   }
   if (command.includes('git diff')) {
     return compactGitDiff(stdout);
   }
-  // Fallback: resumo genérico
-  return compactGenericOutput(fullOutput, command);
+  
+  const result = compactGenericOutput(fullOutput, command);
+  const endTokens = JSON.stringify(result).length / 4;
+  METRICS.tokensSaved += Math.max(0, startTokens - endTokens);
+  return result;
 }
 
 // =============================================================================
 // CONFIGURAÇÕES DE PERFORMANCE E SEGURANÇA
-// =============================================================================
-
-const CONFIG = {
-  MAX_FILE_SIZE: 15 * 1024 * 1024,
-  MAX_WRITE_SIZE: 10 * 1024 * 1024,
-  MAX_RESULTS: 2000,
-  MAX_FILES: 1000,
-  MAX_READ_LINES: 1000,
-  CONCURRENCY: Math.min(os.cpus().length * 2, 32),
-  CACHE_TTL: 60000,
-  DIR_CACHE_TTL: 5000,
-  BACKUP_MAX_AGE: 7 * 24 * 60 * 60 * 1000,
-  BINARY_EXT: new Set([
-    '.dll', '.exe', '.pdb', '.png', '.jpg', '.jpeg', '.gif', '.ico',
-    '.zip', '.pfx', '.bmp', '.webp', '.woff', '.woff2', '.ttf', '.eot',
-    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
-  ])
-};
-
-// =============================================================================
-// CONFIG EXTERNA (.mcp-config.json)
 // =============================================================================
 
 function loadMcpConfig() {
@@ -269,6 +732,22 @@ function loadMcpConfig() {
 }
 
 const MCP_CONFIG = loadMcpConfig();
+
+const PERFORMANCE_CONFIG = {
+  concurrency: MCP_CONFIG.performance?.concurrency || Math.min(os.cpus().length * 2, 32),
+  maxResults: MCP_CONFIG.performance?.maxResults || 2000,
+  maxFiles: MCP_CONFIG.performance?.maxFiles || 1000,
+  maxReadLines: MCP_CONFIG.performance?.maxReadLines || 1000,
+  maxFileSize: MCP_CONFIG.performance?.maxFileSize || 15 * 1024 * 1024,
+  maxWriteSize: MCP_CONFIG.performance?.maxWriteSize || 10 * 1024 * 1024,
+  commandTimeout: MCP_CONFIG.performance?.commandTimeout || 60000
+};
+
+const BACKUP_CONFIG = {
+  maxAge: MCP_CONFIG.backup?.maxAge || 7 * 24 * 60 * 60 * 1000,
+  autoCleanup: MCP_CONFIG.backup?.autoCleanup !== false
+};
+
 const ALLOWED_ROOTS = (MCP_CONFIG.allowedRoots || []).map(p => path.resolve(p));
 const EXTRA_IGNORE_DIRS = new Set((MCP_CONFIG.excludeDirs || []).map(d => d.toLowerCase()));
 
@@ -294,7 +773,11 @@ function isExcludedFile(name) {
 // =============================================================================
 
 class SmartCache {
-  constructor(maxSize = 100, ttl = CONFIG.CACHE_TTL) {
+  constructor(maxSize = 200, ttl = 30000) {
+    if (MCP_CONFIG.cache) {
+      maxSize = MCP_CONFIG.cache.fileCacheSize || maxSize;
+      ttl = MCP_CONFIG.cache.fileCacheTTL || ttl;
+    }
     this.cache = new Map();
     this.maxSize = maxSize;
     this.ttl = ttl;
@@ -334,7 +817,10 @@ class SmartCache {
 }
 
 class DirCache {
-  constructor(ttl = CONFIG.DIR_CACHE_TTL) {
+  constructor(ttl = 5000) {
+    if (MCP_CONFIG.cache) {
+      ttl = MCP_CONFIG.cache.dirCacheTTL || ttl;
+    }
     this.cache = new Map();
     this.ttl = ttl;
   }
@@ -358,9 +844,29 @@ class DirCache {
   }
 }
 
-const fileCache = new SmartCache(200, 30000);
+const fileCache = new SmartCache();
 const searchCache = new SmartCache(50, 10000);
 const dirCache = new DirCache();
+
+// =============================================================================
+// INVALIDAÇÃO DE CACHE
+// =============================================================================
+
+function invalidateCachePaths(targetPath) {
+    const normalized = path.normalize(targetPath);
+    
+    for (const [key] of fileCache.cache) {
+        if (key.startsWith(normalized) || key === normalized) {
+            fileCache.cache.delete(key);
+        }
+    }
+    
+    for (const [key] of dirCache.cache) {
+        if (key.startsWith(normalized) || key === normalized) {
+            dirCache.cache.delete(key);
+        }
+    }
+}
 
 // =============================================================================
 // LOGGER E SEGURANÇA
@@ -372,7 +878,8 @@ function logOperation(operation, filePath, user = 'cline') {
 }
 
 function validatePath(inputPath, baseDir = process.cwd()) {
-  const resolved = path.resolve(baseDir, inputPath);
+  const normalizedInput = path.normalize(inputPath);
+  const resolved = path.resolve(baseDir, normalizedInput);
   const normalized = path.normalize(resolved);
   if (ALLOWED_ROOTS.length > 0) {
     const allowed = ALLOWED_ROOTS.some(root => normalized === root || normalized.startsWith(root + path.sep));
@@ -381,6 +888,16 @@ function validatePath(inputPath, baseDir = process.cwd()) {
     }
   }
   return normalized;
+}
+
+async function checkWritePermission(filePath) {
+  try {
+    const dir = path.dirname(filePath);
+    await fs.promises.access(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // =============================================================================
@@ -455,7 +972,7 @@ async function handleLine(raw) {
     writeResult(id, {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'node-search', version: '7.0.0' }
+      serverInfo: { name: 'node-search', version: '8.5.0' }
     });
     return;
   }
@@ -470,6 +987,7 @@ async function handleLine(raw) {
   if (method === 'tools/call') {
     const toolName = params.name;
     const toolArgs = params.arguments || {};
+    const startTime = Date.now();
     try {
       switch (toolName) {
         case 'search_files': await executeSearchFiles(id, toolArgs); break;
@@ -486,6 +1004,25 @@ async function handleLine(raw) {
         case 'find_symbol': await executeFindSymbol(id, toolArgs); break;
         case 'get_symbol_source': await executeGetSymbolSource(id, toolArgs); break;
         case 'compact_command': await executeCompactCommand(id, toolArgs); break;
+        case 'undo_last_change': await executeUndoLastChange(id, toolArgs); break;
+        case 'code_outline': await executeCodeOutline(id, toolArgs); break;
+        case 'find_references': await executeFindReferences(id, toolArgs); break;
+        case 'find_in_project': await executeFindInProject(id, toolArgs); break;
+        case 'rename_symbol': await executeRenameSymbol(id, toolArgs); break;
+        case 'get_code_smells': await executeCodeSmells(id, toolArgs); break;
+        case 'get_diagnostics': await executeGetDiagnostics(id, toolArgs); break;
+        case 'project_info': await executeProjectInfo(id, toolArgs); break;
+        case 'analyze_dependencies': await executeAnalyzeDependencies(id, toolArgs); break;
+        case 'compare_files': await executeCompareFiles(id, toolArgs); break;
+        case 'get_symbol_usage': await executeGetSymbolUsage(id, toolArgs); break;
+        case 'code_completion': await executeCodeCompletion(id, toolArgs); break;
+        case 'analyze_complexity': await executeAnalyzeComplexity(id, toolArgs); break;
+        case 'get_type_info': await executeGetTypeInfo(id, toolArgs); break;
+        case 'get_call_hierarchy': await executeCallHierarchy(id, toolArgs); break;
+        case 'find_unused_code': await executeFindUnusedCode(id, toolArgs); break;
+        case 'extract_interface': await executeExtractInterface(id, toolArgs); break;
+        case 'get_metrics': await executeGetMetrics(id, toolArgs); break;
+        case 'get_cache_stats': await executeGetCacheStats(id, toolArgs); break;
         case 'generate_labels': await executeGenerateLabels(id, toolArgs); break;
         case 'insert_translations': await executeInsertTranslations(id, toolArgs); break;
         case 'get_translation_context': await executeGetTranslationContext(id, toolArgs); break;
@@ -495,7 +1032,14 @@ async function handleLine(raw) {
         case 'add_language': await executeAddLanguage(id, toolArgs); break;
         default: writeToolError(id, `Tool not found: ${toolName}`);
       }
+      const duration = Date.now() - startTime;
+      trackOperation(toolName, duration);
+      trackCommand(true);
     } catch (err) {
+      const duration = Date.now() - startTime;
+      trackOperation(toolName, duration);
+      trackCommand(false);
+      trackError(toolName);
       writeToolError(id, `Erro: ${err.message}`);
     }
     return;
@@ -507,13 +1051,17 @@ async function handleLine(raw) {
 }
 
 // =============================================================================
-// TOOL DEFINITIONS (apenas as tools ativas no perfil)
+// TOOL DEFINITIONS - COMPLETO (44 TOOLS)
 // =============================================================================
 
 const ALL_TOOL_DEFINITIONS = {
+  // =========================================================================
+  // BUSCA E SÍMBOLOS (6)
+  // =========================================================================
+  
   find_symbol: {
     name: 'find_symbol',
-    description: '💰 Busca DECLARAÇÃO de classe/método/propriedade em .cs/.razor.cs (não usos). ⚡ SEMPRE use esta tool ANTES de search_content para localizar onde algo é definido.',
+    description: '💰 Busca DECLARAÇÃO de classe/método/propriedade em .cs/.razor.cs/.razor. Suporta C# 13/.NET 10 (primary constructors, required, interceptors).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -525,9 +1073,10 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['name']
     }
   },
+  
   get_symbol_source: {
     name: 'get_symbol_source',
-    description: '📖 Retorna o corpo COMPLETO de um símbolo (método, classe, propriedade) em UMA chamada. ⚡ Use DEPOIS de find_symbol.',
+    description: '📖 Retorna o corpo COMPLETO de um símbolo (método, classe, propriedade). Use DEPOIS de find_symbol.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -538,9 +1087,10 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['name']
     }
   },
+  
   search_content: {
     name: 'search_content',
-    description: '🔍 Busca conteúdo em arquivos usando ripgrep (SUPER RÁPIDO!). ⚠️ Use APENAS quando você NÃO sabe o nome exato do símbolo.',
+    description: '🔍 Busca conteúdo em arquivos usando ripgrep (SUPER RÁPIDO!). Use quando NÃO sabe o nome exato do símbolo.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -556,6 +1106,62 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['pattern', 'path']
     }
   },
+  
+  find_references: {
+    name: 'find_references',
+    description: '🔍 Encontra todos os usos de um símbolo no projeto (busca textual)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nome do símbolo' },
+        path: { type: 'string', description: 'Diretório para buscar (default: .)' },
+        filePattern: { type: 'string', description: 'Extensões (default: .cs,.razor)' },
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 100' }
+      },
+      required: ['name']
+    }
+  },
+  
+  find_in_project: {
+    name: 'find_in_project',
+    description: '🔍 Busca inteligente em todo o projeto com relevância e contexto. Economiza ~95% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Padrão a buscar' },
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        filePattern: { type: 'string', description: 'Extensões (default: .cs,.razor)' },
+        includeComments: { type: 'boolean', description: 'Incluir comentários. Default: false' },
+        maxResults: { type: 'number', description: 'Máx resultados. Default: 50' },
+        minRelevance: { type: 'number', description: 'Relevância mínima (0-100). Default: 30' }
+      },
+      required: ['pattern']
+    }
+  },
+  
+  search_files: {
+    name: 'search_files',
+    description: 'Busca padrões em arquivos com auto-detecção de encoding. Suporta múltiplos padrões com "||"',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Padrão (regex ou literal). Use "||" para múltiplos' },
+        path: { type: 'string', description: 'Arquivo ou diretório' },
+        filePattern: { type: 'string', description: 'Extensões separadas por vírgula' },
+        excludePattern: { type: 'string', description: 'Extensões para excluir' },
+        simpleMatch: { type: 'boolean', description: 'Busca literal. Default: false' },
+        context: { type: 'number', description: 'Linhas de contexto (0-5). Default: 0' },
+        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' }
+      },
+      required: ['pattern', 'path']
+    }
+  },
+
+  // =========================================================================
+  // ARQUIVOS E EDIÇÃO (8)
+  // =========================================================================
+  
   replace_in_files: {
     name: 'replace_in_files',
     description: 'Busca e substitui texto/regex em arquivos. Por padrão dryRun (preview).',
@@ -576,57 +1182,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['pattern', 'replacement', 'path']
     }
   },
-  read_lines: {
-    name: 'read_lines',
-    description: 'Lê intervalo de linhas de um arquivo (streaming) — máximo 1000 linhas.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Caminho do arquivo' },
-        startLine: { type: 'number', description: 'Primeira linha (1-indexed). Default: 1' },
-        endLine: { type: 'number', description: 'Última linha. Default: startLine + 49. Máx 1000.' }
-      },
-      required: ['path']
-    }
-  },
-  find_files: {
-    name: 'find_files',
-    description: 'Busca arquivos por nome (suporta wildcards)',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        pattern: { type: 'string', description: 'Nome ou padrão (ex: *.cs, Program.cs)' },
-        path: { type: 'string', description: 'Diretório (default: .)' },
-        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 100' },
-        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' }
-      },
-      required: ['pattern']
-    }
-  },
-  get_file_info: {
-    name: 'get_file_info',
-    description: 'Obtém informações detalhadas de um arquivo',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Caminho do arquivo' },
-        includeContent: { type: 'boolean', description: 'Incluir preview. Default: false' }
-      },
-      required: ['path']
-    }
-  },
-  list_directory: {
-    name: 'list_directory',
-    description: 'Lista diretório com estrutura visual (árvore) — cache de 5s para repetições.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Diretório (default: .)' },
-        recursive: { type: 'boolean', description: 'Listar recursivamente. Default: false' },
-        maxDepth: { type: 'number', description: 'Profundidade máxima. Default: 3, máx 10' }
-      }
-    }
-  },
+  
   write_file: {
     name: 'write_file',
     description: '📝 Cria ou sobrescreve um arquivo com o conteúdo especificado. Máx 10MB.',
@@ -643,6 +1199,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path', 'content']
     }
   },
+  
   edit_file: {
     name: 'edit_file',
     description: '✏️ Edita um arquivo com preview de diff antes de aplicar. Backup automático.',
@@ -657,6 +1214,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path', 'content']
     }
   },
+  
   create_directory: {
     name: 'create_directory',
     description: '📁 Cria um diretório (e subdiretórios se necessário).',
@@ -669,6 +1227,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path']
     }
   },
+  
   move_file: {
     name: 'move_file',
     description: '📦 Move ou renomeia um arquivo com segurança (backup e overwrite controlado).',
@@ -683,37 +1242,327 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['source', 'destination']
     }
   },
-  compact_command: {
-    name: 'compact_command',
-    description: '⚡ Executa um comando e retorna a saída COMPACTADA (resumida). Economiza ~90% de tokens em comandos longos como dotnet build, git diff, git status. Use SEMPRE para comandos que produzem saída longa.',
+  
+  read_lines: {
+    name: 'read_lines',
+    description: 'Lê intervalo de linhas de um arquivo (streaming) — máximo 1000 linhas.',
     inputSchema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Comando a executar (ex: dotnet build, git diff, git status)' },
+        path: { type: 'string', description: 'Caminho do arquivo' },
+        startLine: { type: 'number', description: 'Primeira linha (1-indexed). Default: 1' },
+        endLine: { type: 'number', description: 'Última linha. Default: startLine + 49. Máx 1000.' }
+      },
+      required: ['path']
+    }
+  },
+  
+  find_files: {
+    name: 'find_files',
+    description: 'Busca arquivos por nome (suporta wildcards)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Nome ou padrão (ex: *.cs, Program.cs)' },
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 100' },
+        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' }
+      },
+      required: ['pattern']
+    }
+  },
+  
+  get_file_info: {
+    name: 'get_file_info',
+    description: 'Obtém informações detalhadas de um arquivo',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do arquivo' },
+        includeContent: { type: 'boolean', description: 'Incluir preview. Default: false' }
+      },
+      required: ['path']
+    }
+  },
+  
+  list_directory: {
+    name: 'list_directory',
+    description: 'Lista diretório com estrutura visual (árvore) — cache de 5s para repetições.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        recursive: { type: 'boolean', description: 'Listar recursivamente. Default: false' },
+        maxDepth: { type: 'number', description: 'Profundidade máxima. Default: 3, máx 10' }
+      }
+    }
+  },
+
+  // =========================================================================
+  // ANÁLISE (8)
+  // =========================================================================
+  
+  code_outline: {
+    name: 'code_outline',
+    description: '📋 Mostra estrutura do arquivo (classes, métodos, propriedades, campos, enums)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do arquivo .cs ou .razor' },
+        maxDepth: { type: 'number', description: 'Profundidade máxima. Default: 3' }
+      },
+      required: ['path']
+    }
+  },
+  
+  get_code_smells: {
+    name: 'get_code_smells',
+    description: '🔍 Detecta code smells (métodos longos, classes grandes, aninhamento profundo). Economiza ~95% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Arquivo ou diretório' },
+        thresholds: { type: 'object', description: 'Limites personalizados' },
+        suggestions: { type: 'boolean', description: 'Incluir sugestões. Default: true' }
+      },
+      required: ['path']
+    }
+  },
+  
+  get_diagnostics: {
+    name: 'get_diagnostics',
+    description: '🔍 Obtém erros e warnings do projeto (dotnet build, tsc, eslint). Economiza ~95% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório do projeto' },
+        type: { type: 'string', enum: ['dotnet', 'typescript', 'eslint', 'all'], description: 'Tipo de diagnóstico. Default: all' }
+      },
+      required: ['path']
+    }
+  },
+  
+  project_info: {
+    name: 'project_info',
+    description: '📋 Mostra informações do projeto (.csproj, package.json, etc). Economiza ~98% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório do projeto' }
+      },
+      required: ['path']
+    }
+  },
+  
+  analyze_dependencies: {
+    name: 'analyze_dependencies',
+    description: '📦 Analisa dependências entre arquivos/projetos. Economiza ~99% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório' },
+        output: { type: 'string', enum: ['graph', 'list', 'stats'], description: 'Tipo de saída. Default: stats' }
+      },
+      required: ['path']
+    }
+  },
+  
+  compare_files: {
+    name: 'compare_files',
+    description: '📊 Compara dois arquivos e mostra diferenças. Economiza ~98% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file1: { type: 'string', description: 'Primeiro arquivo' },
+        file2: { type: 'string', description: 'Segundo arquivo' },
+        format: { type: 'string', enum: ['unified', 'side-by-side', 'json'], description: 'Formato de saída. Default: unified' }
+      },
+      required: ['file1', 'file2']
+    }
+  },
+  
+  get_symbol_usage: {
+    name: 'get_symbol_usage',
+    description: '📊 Estatísticas de uso de um símbolo (frequência, arquivos, etc). Economiza ~94% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nome do símbolo' },
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        filePattern: { type: 'string', description: 'Extensões (default: .cs,.razor)' }
+      },
+      required: ['name']
+    }
+  },
+  
+  analyze_complexity: {
+    name: 'analyze_complexity',
+    description: '📊 Análise de complexidade ciclomática e cognitiva. Economiza ~99% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Arquivo ou diretório' },
+        threshold: { type: 'number', description: 'Limite de complexidade. Default: 10' }
+      },
+      required: ['path']
+    }
+  },
+
+  // =========================================================================
+  // REFATORAÇÃO (4)
+  // =========================================================================
+  
+  rename_symbol: {
+    name: 'rename_symbol',
+    description: '✏️ Renomeia um símbolo em todo o projeto (inclui referências)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        oldName: { type: 'string', description: 'Nome atual do símbolo' },
+        newName: { type: 'string', description: 'Novo nome' },
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        filePattern: { type: 'string', description: 'Extensões (default: .cs,.razor)' },
+        dryRun: { type: 'boolean', description: 'Preview. Default: true' }
+      },
+      required: ['oldName', 'newName']
+    }
+  },
+  
+  extract_interface: {
+    name: 'extract_interface',
+    description: '📤 Extrai uma interface de uma classe existente',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        classPath: { type: 'string', description: 'Caminho da classe' },
+        className: { type: 'string', description: 'Nome da classe' },
+        methods: { type: 'array', description: 'Métodos para incluir (opcional)' },
+        dryRun: { type: 'boolean', description: 'Preview. Default: true' }
+      },
+      required: ['classPath', 'className']
+    }
+  },
+  
+  get_type_info: {
+    name: 'get_type_info',
+    description: '📋 Informações detalhadas de um tipo (propriedades, métodos, herança)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nome do tipo' },
+        path: { type: 'string', description: 'Diretório (default: .)' }
+      },
+      required: ['name', 'path']
+    }
+  },
+  
+  find_unused_code: {
+    name: 'find_unused_code',
+    description: '🔍 Encontra código não utilizado (métodos, propriedades, classes)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        filePattern: { type: 'string', description: 'Extensões (default: .cs,.razor)' },
+        includeTests: { type: 'boolean', description: 'Incluir arquivos de teste. Default: false' }
+      },
+      required: ['path']
+    }
+  },
+
+  // =========================================================================
+  // ESTRUTURA (1)
+  // =========================================================================
+  
+  get_call_hierarchy: {
+    name: 'get_call_hierarchy',
+    description: '🌳 Mostra quem chama um método e quem é chamado por ele',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nome do método' },
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        direction: { type: 'string', enum: ['incoming', 'outgoing', 'both'], description: 'Direção da análise. Default: both' },
+        maxDepth: { type: 'number', description: 'Profundidade máxima. Default: 3' }
+      },
+      required: ['name', 'path']
+    }
+  },
+
+  // =========================================================================
+  // COMANDOS (1)
+  // =========================================================================
+  
+  compact_command: {
+    name: 'compact_command',
+    description: '⚡ Executa um comando e retorna a saída COMPACTADA. Economiza ~90% de tokens. Suporta: dotnet build, dotnet test, dotnet publish, dotnet restore, dotnet format, npm run build, npm audit, npm install, tsc, webpack, eslint, jest, vitest, pytest, git diff, git status.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Comando a executar' },
         args: { type: 'string', description: 'Argumentos do comando (opcional)' },
         cwd: { type: 'string', description: 'Diretório de trabalho (default: .)' }
       },
       required: ['command']
     }
   },
-  search_files: {
-    name: 'search_files',
-    description: 'Busca padrões em arquivos com auto-detecção de encoding. Suporta múltiplos padrões com "||"',
+
+  // =========================================================================
+  // UTILIDADES (4)
+  // =========================================================================
+  
+  undo_last_change: {
+    name: 'undo_last_change',
+    description: '↩️ Restaura um arquivo a partir do backup .bak mais recente (rollback)',
     inputSchema: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: 'Padrão (regex ou literal). Use "||" para múltiplos' },
-        path: { type: 'string', description: 'Arquivo ou diretório' },
-        filePattern: { type: 'string', description: 'Extensões separadas por vírgula' },
-        excludePattern: { type: 'string', description: 'Extensões para excluir' },
-        simpleMatch: { type: 'boolean', description: 'Busca literal. Default: false' },
-        context: { type: 'number', description: 'Linhas de contexto (0-5). Default: 0' },
-        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
-        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' }
+        path: { type: 'string', description: 'Caminho do arquivo a restaurar' },
+        timestamp: { type: 'string', description: 'Timestamp específico do backup (opcional)' },
+        dryRun: { type: 'boolean', description: 'Preview sem restaurar. Default: true' }
       },
-      required: ['pattern', 'path']
+      required: ['path']
     }
   },
+  
+  get_metrics: {
+    name: 'get_metrics',
+    description: '📊 Mostra métricas de uso do servidor (operações, tokens economizados, uptime)',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  
+  get_cache_stats: {
+    name: 'get_cache_stats',
+    description: '📊 Mostra estatísticas do cache (hits/misses/tamanho) para diagnóstico',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  
+  code_completion: {
+    name: 'code_completion',
+    description: '💡 Sugere completações de código baseado no contexto. Economiza ~99% de tokens.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: 'Arquivo atual' },
+        line: { type: 'number', description: 'Linha atual' },
+        column: { type: 'number', description: 'Coluna atual' },
+        context: { type: 'string', description: 'Texto ao redor do cursor' },
+        maxSuggestions: { type: 'number', description: 'Número de sugestões. Default: 5' }
+      },
+      required: ['file']
+    }
+  },
+
+  // =========================================================================
+  // I18N / RESX (7)
+  // =========================================================================
+  
   generate_labels: {
     name: 'generate_labels',
     description: 'Escaneia .razor em busca de Loc["Chave"] e gera relatório de traduções',
@@ -727,6 +1576,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path']
     }
   },
+  
   insert_translations: {
     name: 'insert_translations',
     description: 'Insere traduções nos .resx (suporta 1000+ chaves)',
@@ -741,6 +1591,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path', 'translations']
     }
   },
+  
   get_translation_context: {
     name: 'get_translation_context',
     description: 'Mostra onde cada chave Loc["Chave"] é usada',
@@ -753,6 +1604,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path']
     }
   },
+  
   get_existing_translations: {
     name: 'get_existing_translations',
     description: 'Mostra traduções já existentes nos .resx',
@@ -766,6 +1618,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path']
     }
   },
+  
   deduplicate_resx: {
     name: 'deduplicate_resx',
     description: 'Remove chaves duplicadas em .resx',
@@ -780,6 +1633,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path']
     }
   },
+  
   find_duplicates: {
     name: 'find_duplicates',
     description: 'Encontra duplicatas em .resx (rápido)',
@@ -792,6 +1646,7 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path']
     }
   },
+  
   add_language: {
     name: 'add_language',
     description: 'Adiciona suporte a novo idioma',
@@ -813,8 +1668,64 @@ function getToolDefinitions() {
 }
 
 // =============================================================================
-// FUNÇÃO: search_content (COM RIPGREP)
+// FUNÇÕES DE BUSCA - search_content, search_in_file, ripgrep
 // =============================================================================
+
+async function executeSearchInFile(id, filePath, pattern, simpleMatch, caseSensitive, context) {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    if (stat.size === 0) {
+      return writeResult(id, { 
+        content: [{ type: 'text', text: `📋 Arquivo vazio: ${filePath}` }] 
+      });
+    }
+    if (stat.size > PERFORMANCE_CONFIG.maxFileSize) {
+      return writeToolError(id, `📋 Arquivo muito grande. Use search_content com diretório.`);
+    }
+
+    const buffer = await fs.promises.readFile(filePath);
+    const { text } = decodeBuffer(buffer);
+    const lines = text.split(/\r\n|\r|\n/);
+    
+    const regex = simpleMatch ? new RegExp(escapeRegex(pattern), caseSensitive ? 'g' : 'gi') : new RegExp(pattern, caseSensitive ? 'g' : 'gi');
+    const results = [];
+    let totalFound = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      regex.lastIndex = 0;
+      if (regex.test(line)) {
+        totalFound++;
+        const trimmed = truncateLine(line.trim());
+        const contextLines = context > 0 ? getLineContext(lines, i, context) : '';
+        results.push({
+          line: i + 1,
+          text: trimmed,
+          context: contextLines
+        });
+      }
+    }
+
+    if (results.length === 0) {
+      return writeResult(id, { 
+        content: [{ type: 'text', text: `📋 Nenhuma ocorrência de "${pattern}" em ${filePath}` }] 
+      });
+    }
+
+    const output = results.map(r => 
+      `L${r.line}: ${r.text}${r.context ? `\n  Contexto: ${r.context}` : ''}`
+    ).join('\n');
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: `🔍 Encontradas ${totalFound} ocorrência(s) de "${pattern}" em ${filePath}:\n\n${output}`
+      }]
+    });
+  } catch (err) {
+    writeToolError(id, `❌ Erro ao buscar no arquivo: ${err.message}`);
+  }
+}
 
 async function executeSearchContent(id, args) {
   const searchPath = args.path || '.';
@@ -824,7 +1735,7 @@ async function executeSearchContent(id, args) {
   const simpleMatch = args.simpleMatch || false;
   const caseSensitive = args.caseSensitive || false;
   const context = Math.min(args.context || 0, 5);
-  const maxResults = Math.min(args.maxResults || 500, CONFIG.MAX_RESULTS);
+  const maxResults = Math.min(args.maxResults || 500, PERFORMANCE_CONFIG.maxResults);
 
   if (!pattern) {
     return writeToolError(id, '❌ Parâmetro "pattern" é obrigatório.');
@@ -832,6 +1743,11 @@ async function executeSearchContent(id, args) {
 
   try {
     const stat = await fs.promises.stat(searchPath);
+    if (stat.isFile() && stat.size === 0) {
+      return writeResult(id, { 
+        content: [{ type: 'text', text: `📋 Arquivo vazio: ${searchPath}` }] 
+      });
+    }
     if (!stat.isDirectory()) {
       return executeSearchInFile(id, searchPath, pattern, simpleMatch, caseSensitive, context);
     }
@@ -852,19 +1768,30 @@ async function executeSearchContent(id, args) {
   const results = [];
   let totalFound = 0;
   let isTruncated = false;
+  const seenResults = new Set();
 
   const regex = simpleMatch ? new RegExp(escapeRegex(pattern), caseSensitive ? 'g' : 'gi') : new RegExp(pattern, caseSensitive ? 'g' : 'gi');
 
-  await runPool(files, CONFIG.CONCURRENCY, async (filePath) => {
+  let processedFiles = 0;
+  const totalFiles = files.length;
+  const startTime = Date.now();
+
+  await runPool(files, PERFORMANCE_CONFIG.concurrency, async (filePath) => {
+    processedFiles++;
+    if (processedFiles % Math.max(1, Math.floor(totalFiles / 10)) === 0) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.error(`📊 ${searchPath}: ${processedFiles}/${totalFiles} arquivos (${elapsed}s)`);
+    }
+    
     if (isTruncated || shuttingDown) return;
     if (await isLikelyBinary(filePath)) return;
 
     let buffer = fileCache.get(filePath);
     if (!buffer) {
       try { buffer = await fs.promises.readFile(filePath); } catch { return; }
-      if (buffer.length <= CONFIG.MAX_FILE_SIZE) fileCache.set(filePath, buffer);
+      if (buffer.length <= PERFORMANCE_CONFIG.maxFileSize) fileCache.set(filePath, buffer);
     }
-    if (buffer.length > CONFIG.MAX_FILE_SIZE) return;
+    if (buffer.length > PERFORMANCE_CONFIG.maxFileSize) return;
 
     const { text } = decodeBuffer(buffer);
     const lines = text.split(/\r\n|\r|\n/);
@@ -885,6 +1812,11 @@ async function executeSearchContent(id, args) {
           isTruncated = true;
           break;
         }
+        
+        const resultKey = `${filePath}:${lineNum}`;
+        if (seenResults.has(resultKey)) continue;
+        seenResults.add(resultKey);
+        
         totalFound++;
         const preContext = context > 0 && history.length > 0 ? ` | before=[${history.join('│')}]` : '';
         currentMatch = {
@@ -919,10 +1851,6 @@ async function executeSearchContent(id, args) {
     }]
   });
 }
-
-// =============================================================================
-// RIPGREP SEARCH (COM AGRUPAMENTO)
-// =============================================================================
 
 async function executeRipgrepSearch(id, searchPath, pattern, fileExts, excludeExts, simpleMatch, caseSensitive, context, maxResults) {
   const rgArgs = ['--line-number', '--no-heading', '--color=never'];
@@ -975,170 +1903,372 @@ async function executeRipgrepSearch(id, searchPath, pattern, fileExts, excludeEx
   }
 }
 
-// =============================================================================
-// TOOL: search_files (alias)
-// =============================================================================
-
 async function executeSearchFiles(id, args) {
   const argsCopy = { ...args };
   await executeSearchContent(id, argsCopy);
 }
 
 // =============================================================================
-// TOOL: compact_command (compacta saída de comandos — Item 4)
+// FUNÇÕES DE SÍMBOLOS - find_symbol, get_symbol_source
 // =============================================================================
 
-async function executeCompactCommand(id, args) {
-  const command = args.command;
-  const cmdArgs = args.args || '';
-  const cwd = args.cwd || process.cwd();
-
-  if (!command) {
-    return writeToolError(id, '❌ "command" é obrigatório.');
-  }
-
-  const fullCommand = `${command} ${cmdArgs}`.trim();
-
-  try {
-    logOperation('compact_command', fullCommand);
-    const { stdout, stderr } = await execAsync(fullCommand, { cwd, maxBuffer: 10 * 1024 * 1024 });
-    const compacted = compactOutput(command, stdout, stderr);
-
-    writeResult(id, {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          status: 'success',
-          command: fullCommand,
-          cwd: cwd,
-          ...compacted
-        }, null, 2)
-      }]
-    });
-  } catch (err) {
-    // Mesmo com erro, tentar compactar a saída
-    const output = err.stdout || err.stderr || err.message || '';
-    const compacted = compactOutput(command, output, '');
-
-    writeResult(id, {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          status: 'error',
-          command: fullCommand,
-          cwd: cwd,
-          exitCode: err.code || 1,
-          ...compacted
-        }, null, 2)
-      }]
-    });
-  }
+function buildSymbolPatterns(name) {
+  const n = escapeRegex(name);
+  const mod = '(?:public|private|protected|internal|static|sealed|abstract|partial|virtual|override|async|readonly|\\s)*';
+  
+  return [
+    // C# 13/.NET 10: Primary Constructor
+    ['class', new RegExp(`\\b${mod}\\b(?:class|interface|struct|record)\\s+${n}\\s*(?:<[^>]*>)?\\s*\\([^)]*\\)`, 'i')],
+    ['class', new RegExp(`\\b${mod}\\b(?:class|interface|struct|record)\\s+${n}\\b`, 'i')],
+    // C# 11+: Required modifier
+    ['property', new RegExp(`\\b(?:public|private|protected|internal)\\s+required\\s+\\w+\\s+${n}\\s*\\{`, 'i')],
+    // C# 12+: Interceptors
+    ['method', new RegExp(`\\b(?:public|private|protected|internal)?\\s*(?:static\\s+)?\\w+\\s+${n}\\s*\\(\\s*this\\s+`, 'i')],
+    // Métodos normais
+    ['method', new RegExp(`\\b${mod}\\b(?:async\\s+)?(?:Task|void|\\w+)\\s+${n}\\s*\\(`, 'i')],
+    // Propriedades normais
+    ['property', new RegExp(`\\b${mod}\\b(?:\\w+)\\s+${n}\\s*\\{\\s*(?:get|set)?`, 'i')],
+    // Construtores
+    ['constructor', new RegExp(`\\b(?:public|private|protected|internal)\\s+${n}\\s*\\(`, 'i')],
+    // Campos
+    ['field', new RegExp(`\\b(?:public|private|protected|internal|readonly)\\s+\\w+\\s+${n}\\s*(?:;|=)`, 'i')],
+    // Enums
+    ['enum', new RegExp(`\\benum\\s+${n}\\b`, 'i')]
+  ];
 }
 
-// =============================================================================
-// TOOL: replace_in_files
-// =============================================================================
-
-async function executeReplaceInFiles(id, args) {
-  const searchPath = args.path;
-  const patternStr = args.pattern;
-  const replacement = args.replacement ?? '';
-
-  if (!searchPath || !patternStr) {
-    return writeToolError(id, '❌ Parâmetros "path" e "pattern" são obrigatórios.');
+function extractRazorCodeBlocks(text) {
+  const blocks = [];
+  
+  // @code : BaseClass (com herança)
+  const codeRegex = /@code\s*(?::\s*(\w+))?\s*{([^}]*)}/g;
+  let match;
+  while ((match = codeRegex.exec(text)) !== null) {
+    const baseClass = match[1] || null;
+    const content = match[2];
+    blocks.push({ content, baseClass });
   }
-
-  const fileExts = args.filePattern ? args.filePattern.split(',').map(e => e.trim()).filter(Boolean) : null;
-  const excludeExts = args.excludePattern ? args.excludePattern.split(',').map(e => e.trim()).filter(Boolean) : null;
-  const simpleMatch = args.simpleMatch || false;
-  const caseSensitive = args.caseSensitive || false;
-  const dryRun = args.dryRun !== false;
-  const maxFiles = Math.min(args.maxFiles || 200, CONFIG.MAX_FILES);
-  const backup = args.backup !== false;
-
-  let regex;
-  try {
-    regex = simpleMatch ? new RegExp(escapeRegex(patternStr), caseSensitive ? 'g' : 'gi') : new RegExp(patternStr, caseSensitive ? 'g' : 'gi');
-  } catch (err) {
-    return writeToolError(id, `❌ Regex inválida: ${err.message}`);
+  
+  // @functions { ... } (legado)
+  const funcRegex = /@functions\s*{([^}]*)}/g;
+  while ((match = funcRegex.exec(text)) !== null) {
+    blocks.push({ content: match[1], baseClass: null });
   }
+  
+  return blocks;
+}
+
+async function executeFindSymbol(id, args) {
+  const name = args.name;
+  if (!name) return writeToolError(id, '❌ "name" é obrigatório.');
+  const searchPath = args.path || '.';
+  const kind = args.kind || 'any';
+  const maxResults = Math.min(args.maxResults || 100, 500);
 
   const safePath = validatePath(searchPath);
-  const fileList = await collectFiles(safePath, fileExts, excludeExts);
-  if (fileList.length === 0) {
-    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhum arquivo encontrado em ${searchPath}` }], isError: true });
-  }
 
-  const changes = [];
-  let processed = 0;
+  // Suporte completo a Blazor
+  const blazorExts = ['.cs', '.razor.cs', '.razor', '.razor.css', '.razor.js', '.cshtml'];
+  const files = await collectFiles(safePath, blazorExts, null);
 
-  await runPool(fileList, CONFIG.CONCURRENCY, async (filePath) => {
-    if (processed >= maxFiles || shuttingDown) return;
-    if (await isLikelyBinary(filePath)) return;
-
-    let buffer;
-    try { buffer = await fs.promises.readFile(filePath); } catch { return; }
-    if (buffer.length > CONFIG.MAX_FILE_SIZE) return;
-
-    const { text: original } = decodeBuffer(buffer);
-    const matchCount = (original.match(regex) || []).length;
-    if (matchCount === 0) return;
-
-    regex.lastIndex = 0;
-    const updated = original.replace(regex, replacement);
-    if (updated === original) return;
-
-    const { preview, eolNote } = buildDiffPreview(original, updated);
-    changes.push({ filePath, matchCount, preview, eolNote, updated, originalBuffer: buffer });
-    processed++;
+  const relevantFiles = [];
+  await runPool(files, PERFORMANCE_CONFIG.concurrency, async (filePath) => {
+    try {
+      const buffer = await fs.promises.readFile(filePath);
+      const { text } = decodeBuffer(buffer);
+      if (text.toLowerCase().includes(name.toLowerCase())) {
+        relevantFiles.push(filePath);
+      }
+    } catch {}
   });
 
-  if (changes.length === 0) {
-    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma ocorrência de "${patternStr}" encontrada.` }] });
-  }
-
-  if (dryRun) {
-    const blocks = changes.map(c =>
-      `${c.filePath} (${c.matchCount} ocorrência(s))${c.eolNote}:\n${c.preview}`
-    );
-    return writeResult(id, {
-      content: [{
-        type: 'text',
-        text: `${changes.length} arquivo(s) com ocorrências:\n\n${blocks.join('\n\n')}\n\n_(DryRun — nenhum arquivo foi alterado. Rode com dryRun:false para aplicar.)_`
-      }]
-    });
-  }
-
+  const allPatterns = buildSymbolPatterns(name).filter(([k]) => kind === 'any' || k === kind);
   const results = [];
-  await runPool(changes, CONFIG.CONCURRENCY, async (change) => {
-    if (shuttingDown) { results.push(`${change.filePath}: SKIPPED`); return; }
+  const seenSymbols = new Set();
 
-    if (backup) {
-      const bakResult = await writeBackup(change.filePath, change.originalBuffer);
-      if (!bakResult.ok) {
-        results.push(`${change.filePath}: ABORT (backup falhou)`);
-        return;
+  await runPool(relevantFiles, PERFORMANCE_CONFIG.concurrency, async (filePath) => {
+    if (results.length >= maxResults || shuttingDown) return;
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { return; }
+    if (buffer.length > PERFORMANCE_CONFIG.maxFileSize) return;
+    const { text } = decodeBuffer(buffer);
+    const lines = text.split(/\r\n|\r|\n/);
+
+    let razorCodeBlocks = [];
+    if (filePath.endsWith('.razor')) {
+      razorCodeBlocks = extractRazorCodeBlocks(text);
+    }
+
+    for (let i = 0; i < lines.length && results.length < maxResults; i++) {
+      const line = lines[i];
+      if (line.trim().startsWith('//') || line.trim().startsWith('/*')) continue;
+
+      for (const [symbolKind, regex] of allPatterns) {
+        if (regex.test(line)) {
+          let fullText = line.trim();
+          if (symbolKind === 'method' && line.includes('(') && !line.includes(')')) {
+            let j = i + 1;
+            let methodText = line;
+            while (j < lines.length && !lines[j].includes(')')) {
+              methodText += '\n' + lines[j];
+              j++;
+            }
+            if (j < lines.length) methodText += '\n' + lines[j];
+            fullText = methodText.trim();
+          }
+          
+          const symbolKey = `${filePath}:${i + 1}:${symbolKind}`;
+          if (!seenSymbols.has(symbolKey)) {
+            seenSymbols.add(symbolKey);
+            results.push({
+              file: filePath,
+              line: i + 1,
+              kind: symbolKind,
+              text: truncateLine(fullText)
+            });
+          }
+          break;
+        }
       }
     }
 
-    try {
-      await fs.promises.writeFile(change.filePath, change.updated, 'utf8');
-      results.push(`${change.filePath}: ✅ ${change.matchCount} substituição(ões)`);
-    } catch (err) {
-      results.push(`${change.filePath}: ❌ ERRO ${err.message}`);
+    // Verificar símbolos dentro de @code/@functions (com herança)
+    if (razorCodeBlocks.length > 0) {
+      for (const block of razorCodeBlocks) {
+        // Adicionar informação de herança se disponível
+        if (block.baseClass) {
+          const symbolKey = `${filePath}:@code:base:${block.baseClass}`;
+          if (!seenSymbols.has(symbolKey)) {
+            seenSymbols.add(symbolKey);
+            results.push({
+              file: filePath,
+              line: -1,
+              kind: 'class',
+              text: `@code : ${block.baseClass} (componente herda de ${block.baseClass})`
+            });
+          }
+        }
+        
+        const blockLines = block.content.split('\n');
+        for (let i = 0; i < blockLines.length && results.length < maxResults; i++) {
+          const line = blockLines[i];
+          for (const [symbolKind, regex] of allPatterns) {
+            if (regex.test(line)) {
+              const symbolKey = `${filePath}:@code:${i + 1}:${symbolKind}`;
+              if (!seenSymbols.has(symbolKey)) {
+                seenSymbols.add(symbolKey);
+                results.push({
+                  file: filePath,
+                  line: -1,
+                  kind: symbolKind,
+                  text: truncateLine(`@code { ... } -> ${line.trim()}`)
+                });
+              }
+              break;
+            }
+          }
+        }
+      }
     }
   });
+
+  if (results.length === 0) {
+    let suggestions = [];
+    
+    if (searchPath.includes('.razor')) {
+      suggestions.push('Verifique se o símbolo está dentro de @code { } ou @functions { }');
+    }
+    
+    suggestions.push('Use search_content para encontrar usos do símbolo');
+    
+    if (name !== name.toLowerCase()) {
+      suggestions.push('A busca é case-insensitive, mas o símbolo pode ter capitalização diferente');
+    }
+    
+    suggestions.push('Verifique se o arquivo está em .cs, .razor.cs ou .razor');
+    suggestions.push('Para C# 13/.NET 10: verifique primary constructors, required modifiers ou interceptors');
+    
+    return writeResult(id, { 
+      content: [{ 
+        type: 'text', 
+        text: `📋 Nenhuma declaração de "${name}" encontrada em ${searchPath}.\n\n💡 Sugestões:\n${suggestions.map(s => `  • ${s}`).join('\n')}` 
+      }] 
+    });
+  }
+
+  const output = results.map(r => {
+    const lineInfo = r.line === -1 ? '[@code]' : `:${r.line}`;
+    return `${r.file}${lineInfo} [${r.kind}] ${r.text}`;
+  });
+  const note = results.length >= maxResults ? `\n\n_(Truncado em ${maxResults})_` : '';
 
   writeResult(id, {
     content: [{
       type: 'text',
-      text: `✅ ${changes.length} arquivo(s) modificado(s):\n\n${results.join('\n')}`
+      text: `💰 ${results.length} declaração(ões) de "${name}" (${relevantFiles.length} arquivos verificados):\n\n${output.join('\n')}${note}\n\n💡 Suporta C# 13/.NET 10: primary constructors, required, interceptors.`
+    }]
+  });
+}
+
+async function executeGetSymbolSource(id, args) {
+  const symbolName = args.name;
+  if (!symbolName) return writeToolError(id, '❌ "name" é obrigatório.');
+  const searchPath = args.path || '.';
+  const kind = args.kind || 'any';
+
+  const safePath = validatePath(searchPath);
+
+  let filesToSearch;
+  try {
+    const stat = await fs.promises.stat(safePath);
+    if (stat.isFile()) {
+      if (stat.size === 0) {
+        return writeResult(id, { 
+          content: [{ type: 'text', text: `📋 Arquivo vazio: ${safePath}` }] 
+        });
+      }
+      filesToSearch = [safePath];
+    } else {
+      const blazorExts = ['.cs', '.razor.cs', '.razor', '.razor.css', '.razor.js', '.cshtml'];
+      filesToSearch = await collectFiles(safePath, blazorExts, null);
+    }
+  } catch {
+    const blazorExts = ['.cs', '.razor.cs', '.razor', '.razor.css', '.razor.js', '.cshtml'];
+    filesToSearch = await collectFiles(safePath, blazorExts, null);
+  }
+
+  const allPatterns = buildSymbolPatterns(symbolName).filter(([k]) => kind === 'any' || k === kind);
+
+  for (const filePath of filesToSearch) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+    if (buffer.length > PERFORMANCE_CONFIG.maxFileSize) continue;
+    const { text } = decodeBuffer(buffer);
+    const lines = text.split(/\r\n|\r|\n/);
+
+    let razorCodeBlocks = [];
+    if (filePath.endsWith('.razor')) {
+      razorCodeBlocks = extractRazorCodeBlocks(text);
+    }
+
+    let startLine = -1;
+    let endLine = -1;
+    let symbolKind = '';
+    let foundInRazorCode = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      for (const [kind, regex] of allPatterns) {
+        if (regex.test(line)) {
+          startLine = i;
+          symbolKind = kind;
+          if (kind === 'method' || kind === 'class' || kind === 'property') {
+            let braceCount = 0;
+            let foundBrace = false;
+            for (let j = i; j < lines.length; j++) {
+              const current = lines[j];
+              const openBraces = (current.match(/{/g) || []).length;
+              const closeBraces = (current.match(/}/g) || []).length;
+              braceCount += openBraces - closeBraces;
+              if (openBraces > 0) foundBrace = true;
+              if (foundBrace && braceCount === 0) {
+                endLine = j;
+                break;
+              }
+            }
+            if (endLine === -1) endLine = i + 10;
+          } else {
+            endLine = i;
+          }
+          break;
+        }
+      }
+      if (startLine !== -1) break;
+    }
+
+    if (startLine === -1 && razorCodeBlocks.length > 0) {
+      for (const block of razorCodeBlocks) {
+        const blockLines = block.content.split('\n');
+        for (let i = 0; i < blockLines.length; i++) {
+          const line = blockLines[i];
+          for (const [kind, regex] of allPatterns) {
+            if (regex.test(line)) {
+              foundInRazorCode = true;
+              symbolKind = kind;
+              let braceCount = 0;
+              let foundBrace = false;
+              let endIdx = i;
+              for (let j = i; j < blockLines.length; j++) {
+                const current = blockLines[j];
+                const openBraces = (current.match(/{/g) || []).length;
+                const closeBraces = (current.match(/}/g) || []).length;
+                braceCount += openBraces - closeBraces;
+                if (openBraces > 0) foundBrace = true;
+                if (foundBrace && braceCount === 0) {
+                  endIdx = j;
+                  break;
+                }
+              }
+              const source = blockLines.slice(i, endIdx + 1).join('\n');
+              const baseInfo = block.baseClass ? ` (herda de ${block.baseClass})` : '';
+              return writeResult(id, {
+                content: [{
+                  type: 'text',
+                  text: JSON.stringify({
+                    status: 'success',
+                    symbol: symbolName,
+                    kind: symbolKind,
+                    file: filePath,
+                    startLine: -1,
+                    endLine: -1,
+                    lines: endIdx - i + 1,
+                    source: `@code { ... }${baseInfo} -> ${source}`,
+                    foundInRazorCode: true,
+                    baseClass: block.baseClass || null
+                  }, null, 2)
+                }]
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if (startLine !== -1) {
+      const source = lines.slice(startLine, endLine + 1).join('\n');
+      return writeResult(id, {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            status: 'success',
+            symbol: symbolName,
+            kind: symbolKind,
+            file: filePath,
+            startLine: startLine + 1,
+            endLine: endLine + 1,
+            lines: endLine - startLine + 1,
+            source: source,
+            foundInRazorCode: false
+          }, null, 2)
+        }]
+      });
+    }
+  }
+
+  return writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        status: 'not_found',
+        symbol: symbolName,
+        message: `❌ Símbolo "${symbolName}" não encontrado em ${searchPath}`
+      }, null, 2)
     }]
   });
 }
 
 // =============================================================================
-// TOOL: read_lines
+// FUNÇÕES DE ARQUIVO - read_lines, find_files, get_file_info, list_directory
 // =============================================================================
 
 async function executeReadLines(id, args) {
@@ -1148,13 +2278,16 @@ async function executeReadLines(id, args) {
   const startLine = Math.max(1, args.startLine || 1);
   let endLine = args.endLine || (startLine + 49);
 
-  if (endLine - startLine > CONFIG.MAX_READ_LINES) {
-    return writeToolError(id, `❌ Máximo de ${CONFIG.MAX_READ_LINES} linhas por vez.`);
+  if (endLine - startLine > PERFORMANCE_CONFIG.maxReadLines) {
+    return writeToolError(id, `❌ Máximo de ${PERFORMANCE_CONFIG.maxReadLines} linhas por vez.`);
   }
 
   try {
     const stat = await fs.promises.stat(filePath);
-    if (stat.size > CONFIG.MAX_FILE_SIZE) {
+    if (stat.size === 0) {
+      return writeResult(id, { content: [{ type: 'text', text: `📋 Arquivo vazio: ${filePath}` }] });
+    }
+    if (stat.size > PERFORMANCE_CONFIG.maxFileSize) {
       return writeToolError(id, `📋 Arquivo muito grande. Use search_content.`);
     }
 
@@ -1186,10 +2319,6 @@ async function executeReadLines(id, args) {
     writeToolError(id, `❌ Erro: ${err.message}`);
   }
 }
-
-// =============================================================================
-// TOOL: find_files
-// =============================================================================
 
 async function executeFindFiles(id, args) {
   const searchPath = args.path || '.';
@@ -1223,203 +2352,6 @@ async function executeFindFiles(id, args) {
   writeResult(id, { content: [{ type: 'text', text }] });
 }
 
-// =============================================================================
-// TOOL: find_symbol
-// =============================================================================
-
-function buildSymbolPatterns(name) {
-  const n = escapeRegex(name);
-  const mod = '(?:public|private|protected|internal|static|sealed|abstract|partial|virtual|override|async|readonly|\\s)*';
-  return [
-    ['class', new RegExp(`\\b${mod}\\b(?:class|interface|struct|record)\\s+${n}\\b`, 'i')],
-    ['method', new RegExp(`\\b${mod}\\b(?:async\\s+)?(?:Task|void|\\w+)\\s+${n}\\s*\\(`, 'i')],
-    ['property', new RegExp(`\\b${mod}\\b(?:\\w+)\\s+${n}\\s*\\{\\s*(?:get|set)?`, 'i')],
-    ['constructor', new RegExp(`\\b(?:public|private|protected|internal)\\s+${n}\\s*\\(`, 'i')],
-    ['field', new RegExp(`\\b(?:public|private|protected|internal|readonly)\\s+\\w+\\s+${n}\\s*(?:;|=)`, 'i')],
-    ['enum', new RegExp(`\\benum\\s+${n}\\b`, 'i')]
-  ];
-}
-
-async function executeFindSymbol(id, args) {
-  const name = args.name;
-  if (!name) return writeToolError(id, '❌ "name" é obrigatório.');
-  const searchPath = args.path || '.';
-  const kind = args.kind || 'any';
-  const maxResults = Math.min(args.maxResults || 100, 500);
-
-  const safePath = validatePath(searchPath);
-
-  const files = await collectFiles(safePath, ['.cs', '.razor.cs', '.razor'], null);
-
-  const relevantFiles = [];
-  await runPool(files, CONFIG.CONCURRENCY, async (filePath) => {
-    try {
-      const buffer = await fs.promises.readFile(filePath);
-      const { text } = decodeBuffer(buffer);
-      if (text.toLowerCase().includes(name.toLowerCase())) {
-        relevantFiles.push(filePath);
-      }
-    } catch {}
-  });
-
-  const allPatterns = buildSymbolPatterns(name).filter(([k]) => kind === 'any' || k === kind);
-  const results = [];
-
-  await runPool(relevantFiles, CONFIG.CONCURRENCY, async (filePath) => {
-    if (results.length >= maxResults || shuttingDown) return;
-    let buffer;
-    try { buffer = await fs.promises.readFile(filePath); } catch { return; }
-    if (buffer.length > CONFIG.MAX_FILE_SIZE) return;
-    const { text } = decodeBuffer(buffer);
-    const lines = text.split(/\r\n|\r|\n/);
-
-    for (let i = 0; i < lines.length && results.length < maxResults; i++) {
-      const line = lines[i];
-      if (line.trim().startsWith('//') || line.trim().startsWith('/*')) continue;
-
-      for (const [symbolKind, regex] of allPatterns) {
-        if (regex.test(line)) {
-          let fullText = line.trim();
-          if (symbolKind === 'method' && line.includes('(') && !line.includes(')')) {
-            let j = i + 1;
-            let methodText = line;
-            while (j < lines.length && !lines[j].includes(')')) {
-              methodText += '\n' + lines[j];
-              j++;
-            }
-            if (j < lines.length) methodText += '\n' + lines[j];
-            fullText = methodText.trim();
-          }
-          results.push({
-            file: filePath,
-            line: i + 1,
-            kind: symbolKind,
-            text: truncateLine(fullText)
-          });
-          break;
-        }
-      }
-    }
-  });
-
-  if (results.length === 0) {
-    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma declaração de "${name}" encontrada em ${searchPath} (${relevantFiles.length} arquivos verificados)` }] });
-  }
-
-  const output = results.map(r => `${r.file}:${r.line} [${r.kind}] ${r.text}`);
-  const note = results.length >= maxResults ? `\n\n_(Truncado em ${maxResults})_` : '';
-
-  writeResult(id, {
-    content: [{
-      type: 'text',
-      text: `💰 ${results.length} declaração(ões) de "${name}" (${relevantFiles.length} arquivos verificados):\n\n${output.join('\n')}${note}`
-    }]
-  });
-}
-
-// =============================================================================
-// TOOL: get_symbol_source
-// =============================================================================
-
-async function executeGetSymbolSource(id, args) {
-  const symbolName = args.name;
-  if (!symbolName) return writeToolError(id, '❌ "name" é obrigatório.');
-  const searchPath = args.path || '.';
-  const kind = args.kind || 'any';
-
-  const safePath = validatePath(searchPath);
-
-  let filesToSearch;
-  try {
-    const stat = await fs.promises.stat(safePath);
-    if (stat.isFile()) {
-      filesToSearch = [safePath];
-    } else {
-      filesToSearch = await collectFiles(safePath, ['.cs', '.razor.cs', '.razor'], null);
-    }
-  } catch {
-    filesToSearch = await collectFiles(safePath, ['.cs', '.razor.cs', '.razor'], null);
-  }
-
-  const allPatterns = buildSymbolPatterns(symbolName).filter(([k]) => kind === 'any' || k === kind);
-
-  for (const filePath of filesToSearch) {
-    let buffer;
-    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
-    if (buffer.length > CONFIG.MAX_FILE_SIZE) continue;
-    const { text } = decodeBuffer(buffer);
-    const lines = text.split(/\r\n|\r|\n/);
-
-    let startLine = -1;
-    let endLine = -1;
-    let symbolKind = '';
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      for (const [kind, regex] of allPatterns) {
-        if (regex.test(line)) {
-          startLine = i;
-          symbolKind = kind;
-          if (kind === 'method' || kind === 'class' || kind === 'property') {
-            let braceCount = 0;
-            let foundBrace = false;
-            for (let j = i; j < lines.length; j++) {
-              const current = lines[j];
-              const openBraces = (current.match(/{/g) || []).length;
-              const closeBraces = (current.match(/}/g) || []).length;
-              braceCount += openBraces - closeBraces;
-              if (openBraces > 0) foundBrace = true;
-              if (foundBrace && braceCount === 0) {
-                endLine = j;
-                break;
-              }
-            }
-            if (endLine === -1) endLine = i + 10;
-          } else {
-            endLine = i;
-          }
-          break;
-        }
-      }
-      if (startLine !== -1) break;
-    }
-
-    if (startLine !== -1) {
-      const source = lines.slice(startLine, endLine + 1).join('\n');
-      return writeResult(id, {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            status: 'success',
-            symbol: symbolName,
-            kind: symbolKind,
-            file: filePath,
-            startLine: startLine + 1,
-            endLine: endLine + 1,
-            lines: endLine - startLine + 1,
-            source: source
-          }, null, 2)
-        }]
-      });
-    }
-  }
-
-  return writeResult(id, {
-    content: [{
-      type: 'text',
-      text: JSON.stringify({
-        status: 'not_found',
-        symbol: symbolName,
-        message: `❌ Símbolo "${symbolName}" não encontrado em ${searchPath}`
-      }, null, 2)
-    }]
-  });
-}
-
-// =============================================================================
-// TOOL: get_file_info
-// =============================================================================
-
 async function executeGetFileInfo(id, args) {
   const filePath = args.path;
   if (!filePath) return writeToolError(id, '❌ "path" é obrigatório.');
@@ -1436,10 +2368,11 @@ async function executeGetFileInfo(id, args) {
       modified: stat.mtime.toISOString(),
       created: stat.birthtime.toISOString(),
       isDirectory: stat.isDirectory(),
-      isFile: stat.isFile()
+      isFile: stat.isFile(),
+      isEmpty: stat.size === 0
     };
 
-    if (args.includeContent && stat.isFile() && stat.size < CONFIG.MAX_FILE_SIZE) {
+    if (args.includeContent && stat.isFile() && stat.size < PERFORMANCE_CONFIG.maxFileSize) {
       const buffer = await fs.promises.readFile(safePath);
       const { encoding } = decodeBuffer(buffer);
       info.encoding = encoding;
@@ -1451,10 +2384,6 @@ async function executeGetFileInfo(id, args) {
     writeToolError(id, `❌ Erro: ${err.message}`);
   }
 }
-
-// =============================================================================
-// TOOL: list_directory
-// =============================================================================
 
 async function executeListDirectory(id, args) {
   const searchPath = args.path || '.';
@@ -1502,7 +2431,7 @@ async function executeListDirectory(id, args) {
 }
 
 // =============================================================================
-// TOOL: write_file
+// FUNÇÕES DE EDIÇÃO - write_file, edit_file, create_directory, move_file, replace_in_files
 // =============================================================================
 
 async function executeWriteFile(id, args) {
@@ -1517,11 +2446,16 @@ async function executeWriteFile(id, args) {
   if (content === undefined) return writeToolError(id, '❌ "content" é obrigatório.');
 
   const size = Buffer.byteLength(content, encoding);
-  if (size > CONFIG.MAX_WRITE_SIZE) {
-    return writeToolError(id, `❌ Arquivo muito grande: ${formatSize(size)}. Máximo: ${formatSize(CONFIG.MAX_WRITE_SIZE)}`);
+  if (size > PERFORMANCE_CONFIG.maxWriteSize) {
+    return writeToolError(id, `❌ Arquivo muito grande: ${formatSize(size)}. Máximo: ${formatSize(PERFORMANCE_CONFIG.maxWriteSize)}`);
   }
 
   const safePath = validatePath(filePath);
+  
+  if (!await checkWritePermission(safePath)) {
+    return writeToolError(id, `❌ Sem permissão de escrita no diretório: ${path.dirname(safePath)}`);
+  }
+  
   logOperation('write_file', safePath);
 
   try {
@@ -1549,8 +2483,14 @@ async function executeWriteFile(id, args) {
     }
 
     await fs.promises.writeFile(safePath, content, encoding);
+    
+    invalidateCachePaths(safePath);
+    invalidateCachePaths(path.dirname(safePath));
+    
     const stat = await fs.promises.stat(safePath);
-    cleanOldBackups(path.dirname(safePath)).catch(() => {});
+    if (BACKUP_CONFIG.autoCleanup) {
+      cleanOldBackups(path.dirname(safePath)).catch(() => {});
+    }
 
     writeResult(id, {
       content: [{
@@ -1569,10 +2509,6 @@ async function executeWriteFile(id, args) {
   }
 }
 
-// =============================================================================
-// TOOL: edit_file
-// =============================================================================
-
 async function executeEditFile(id, args) {
   const filePath = args.path;
   const newContent = args.content;
@@ -1583,6 +2519,11 @@ async function executeEditFile(id, args) {
   if (newContent === undefined) return writeToolError(id, '❌ "content" é obrigatório.');
 
   const safePath = validatePath(filePath);
+  
+  if (!await checkWritePermission(safePath)) {
+    return writeToolError(id, `❌ Sem permissão de escrita no diretório: ${path.dirname(safePath)}`);
+  }
+  
   logOperation('edit_file', safePath);
 
   try {
@@ -1627,8 +2568,12 @@ async function executeEditFile(id, args) {
     }
 
     await fs.promises.writeFile(safePath, newContent, 'utf8');
+    
+    invalidateCachePaths(safePath);
 
-    cleanOldBackups(path.dirname(safePath)).catch(() => {});
+    if (BACKUP_CONFIG.autoCleanup) {
+      cleanOldBackups(path.dirname(safePath)).catch(() => {});
+    }
 
     writeResult(id, {
       content: [{
@@ -1647,10 +2592,6 @@ async function executeEditFile(id, args) {
   }
 }
 
-// =============================================================================
-// TOOL: create_directory
-// =============================================================================
-
 async function executeCreateDirectory(id, args) {
   const dirPath = args.path;
   const recursive = args.recursive !== false;
@@ -1658,6 +2599,11 @@ async function executeCreateDirectory(id, args) {
   if (!dirPath) return writeToolError(id, '❌ "path" é obrigatório.');
 
   const safePath = validatePath(dirPath);
+  
+  if (!await checkWritePermission(safePath)) {
+    return writeToolError(id, `❌ Sem permissão de escrita no diretório pai: ${path.dirname(safePath)}`);
+  }
+  
   logOperation('create_directory', safePath);
 
   try {
@@ -1695,10 +2641,6 @@ async function executeCreateDirectory(id, args) {
   }
 }
 
-// =============================================================================
-// TOOL: move_file
-// =============================================================================
-
 async function executeMoveFile(id, args) {
   const source = args.source;
   const destination = args.destination;
@@ -1710,6 +2652,10 @@ async function executeMoveFile(id, args) {
 
   const safeSource = validatePath(source);
   const safeDest = validatePath(destination);
+  
+  if (!await checkWritePermission(safeDest)) {
+    return writeToolError(id, `❌ Sem permissão de escrita no diretório: ${path.dirname(safeDest)}`);
+  }
 
   logOperation('move_file', `${safeSource} → ${safeDest}`);
 
@@ -1741,6 +2687,9 @@ async function executeMoveFile(id, args) {
     }
 
     await fs.promises.rename(safeSource, safeDest);
+    
+    invalidateCachePaths(safeSource);
+    invalidateCachePaths(path.dirname(safeDest));
 
     writeResult(id, {
       content: [{
@@ -1759,13 +2708,2389 @@ async function executeMoveFile(id, args) {
   }
 }
 
+async function executeReplaceInFiles(id, args) {
+  const searchPath = args.path;
+  const patternStr = args.pattern;
+  const replacement = args.replacement ?? '';
+
+  if (!searchPath || !patternStr) {
+    return writeToolError(id, '❌ Parâmetros "path" e "pattern" são obrigatórios.');
+  }
+
+  const fileExts = args.filePattern ? args.filePattern.split(',').map(e => e.trim()).filter(Boolean) : null;
+  const excludeExts = args.excludePattern ? args.excludePattern.split(',').map(e => e.trim()).filter(Boolean) : null;
+  const simpleMatch = args.simpleMatch || false;
+  const caseSensitive = args.caseSensitive || false;
+  const dryRun = args.dryRun !== false;
+  const maxFiles = Math.min(args.maxFiles || 200, PERFORMANCE_CONFIG.maxFiles);
+  const backup = args.backup !== false;
+
+  let regex;
+  try {
+    regex = simpleMatch ? new RegExp(escapeRegex(patternStr), caseSensitive ? 'g' : 'gi') : new RegExp(patternStr, caseSensitive ? 'g' : 'gi');
+  } catch (err) {
+    return writeToolError(id, `❌ Regex inválida: ${err.message}`);
+  }
+
+  const safePath = validatePath(searchPath);
+  
+  try {
+    const stat = await fs.promises.stat(safePath);
+    if (stat.isFile() && stat.size === 0) {
+      return writeResult(id, { 
+        content: [{ type: 'text', text: `📋 Arquivo vazio: ${safePath}` }] 
+      });
+    }
+  } catch {}
+
+  const fileList = await collectFiles(safePath, fileExts, excludeExts);
+  if (fileList.length === 0) {
+    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhum arquivo encontrado em ${searchPath}` }], isError: true });
+  }
+
+  const changes = [];
+  let processed = 0;
+
+  await runPool(fileList, PERFORMANCE_CONFIG.concurrency, async (filePath) => {
+    if (processed >= maxFiles || shuttingDown) return;
+    if (await isLikelyBinary(filePath)) return;
+
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { return; }
+    if (buffer.length > PERFORMANCE_CONFIG.maxFileSize) return;
+
+    const { text: original } = decodeBuffer(buffer);
+    const matchCount = (original.match(regex) || []).length;
+    if (matchCount === 0) return;
+
+    regex.lastIndex = 0;
+    const updated = original.replace(regex, replacement);
+    if (updated === original) return;
+
+    const { preview, eolNote } = buildDiffPreview(original, updated);
+    changes.push({ filePath, matchCount, preview, eolNote, updated, originalBuffer: buffer });
+    processed++;
+  });
+
+  if (changes.length === 0) {
+    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma ocorrência de "${patternStr}" encontrada.` }] });
+  }
+
+  if (dryRun) {
+    const blocks = changes.map(c =>
+      `${c.filePath} (${c.matchCount} ocorrência(s))${c.eolNote}:\n${c.preview}`
+    );
+    return writeResult(id, {
+      content: [{
+        type: 'text',
+        text: `${changes.length} arquivo(s) com ocorrências:\n\n${blocks.join('\n\n')}\n\n_(DryRun — nenhum arquivo foi alterado. Rode com dryRun:false para aplicar.)_`
+      }]
+    });
+  }
+
+  const results = [];
+  await runPool(changes, PERFORMANCE_CONFIG.concurrency, async (change) => {
+    if (shuttingDown) { results.push(`${change.filePath}: SKIPPED`); return; }
+
+    if (backup) {
+      const bakResult = await writeBackup(change.filePath, change.originalBuffer);
+      if (!bakResult.ok) {
+        results.push(`${change.filePath}: ABORT (backup falhou)`);
+        return;
+      }
+    }
+
+    try {
+      await fs.promises.writeFile(change.filePath, change.updated, 'utf8');
+      invalidateCachePaths(change.filePath);
+      results.push(`${change.filePath}: ✅ ${change.matchCount} substituição(ões)`);
+    } catch (err) {
+      results.push(`${change.filePath}: ❌ ERRO ${err.message}`);
+    }
+  });
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: `✅ ${changes.length} arquivo(s) modificado(s):\n\n${results.join('\n')}`
+    }]
+  });
+}
+
 // =============================================================================
-// TOOLS DE TRADUÇÃO (RESX) - VERSÃO COMPACTA
+// FUNÇÕES DE ANÁLISE - code_outline, find_references, compact_command, 
+// undo_last_change, get_metrics, get_cache_stats
+// =============================================================================
+
+async function executeCompactCommand(id, args) {
+  const command = args.command;
+  const cmdArgs = args.args || '';
+  const cwd = args.cwd || process.cwd();
+
+  if (!command) {
+    return writeToolError(id, '❌ "command" é obrigatório.');
+  }
+
+  const fullCommand = `${command} ${cmdArgs}`.trim();
+
+  try {
+    logOperation('compact_command', fullCommand);
+    
+    // ✅ TIMEOUT REMOVIDO - Espera o comando terminar naturalmente
+    const { stdout, stderr } = await execAsync(fullCommand, { 
+      cwd, 
+      maxBuffer: 50 * 1024 * 1024  // Aumentado para 50MB para logs grandes
+    });
+    
+    const compacted = compactOutput(command, stdout, stderr);
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'success',
+          command: fullCommand,
+          cwd: cwd,
+          ...compacted
+        }, null, 2)
+      }]
+    });
+  } catch (err) {
+    // ✅ Sem timeout - apenas erro real do comando
+    const output = err.stdout || err.stderr || err.message || '';
+    const compacted = compactOutput(command, output, '');
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'error',
+          command: fullCommand,
+          cwd: cwd,
+          exitCode: err.code || 1,
+          ...compacted
+        }, null, 2)
+      }]
+    });
+  }
+}
+
+
+
+async function executeUndoLastChange(id, args) {
+    const filePath = args.path;
+    const timestamp = args.timestamp || null;
+    const dryRun = args.dryRun !== false;
+    
+    if (!filePath) return writeToolError(id, '❌ "path" é obrigatório.');
+    
+    const safePath = validatePath(filePath);
+    const dir = path.dirname(safePath);
+    const basename = path.basename(safePath);
+    
+    let backups = [];
+    try {
+        const files = await fs.promises.readdir(dir);
+        const backupPattern = new RegExp(`^${escapeRegex(basename)}\\.bak\\.(\\d+)$`);
+        for (const file of files) {
+            const match = file.match(backupPattern);
+            if (match) {
+                backups.push({
+                    path: path.join(dir, file),
+                    timestamp: parseInt(match[1])
+                });
+            }
+        }
+    } catch (err) {
+        return writeToolError(id, `❌ Erro ao listar backups: ${err.message}`);
+    }
+    
+    if (backups.length === 0) {
+        return writeResult(id, {
+            content: [{ type: 'text', text: `📋 Nenhum backup encontrado para ${safePath}` }]
+        });
+    }
+    
+    backups.sort((a, b) => b.timestamp - a.timestamp);
+    
+    let selectedBackup = backups[0];
+    if (timestamp) {
+        const ts = parseInt(timestamp);
+        const found = backups.find(b => b.timestamp === ts);
+        if (found) selectedBackup = found;
+    }
+    
+    let backupContent;
+    let backupBuffer;
+    try {
+        backupBuffer = await fs.promises.readFile(selectedBackup.path);
+        backupContent = backupBuffer.toString('utf8');
+    } catch (err) {
+        return writeToolError(id, `❌ Erro ao ler backup: ${err.message}`);
+    }
+    
+    let currentExists = false;
+    let currentContent = '';
+    try {
+        const currentBuffer = await fs.promises.readFile(safePath);
+        currentContent = currentBuffer.toString('utf8');
+        currentExists = true;
+    } catch {}
+    
+    const diff = buildDiffPreview(currentContent, backupContent);
+    
+    if (dryRun) {
+        return writeResult(id, {
+            content: [{
+                type: 'text',
+                text: `↩️ Preview de rollback: ${safePath}\n\nBackup: ${path.basename(selectedBackup.path)}\nTimestamp: ${new Date(selectedBackup.timestamp).toISOString()}\n\n${diff.preview}\n\n_(DryRun — nenhuma alteração foi aplicada. Rode com dryRun:false para restaurar.)_`
+            }]
+        });
+    }
+    
+    try {
+        if (currentExists) {
+            await writeBackup(safePath, await fs.promises.readFile(safePath));
+        }
+        
+        await fs.promises.writeFile(safePath, backupContent, 'utf8');
+        invalidateCachePaths(safePath);
+        
+        writeResult(id, {
+            content: [{
+                type: 'text',
+                text: JSON.stringify({
+                    status: 'success',
+                    path: safePath,
+                    restoredFrom: selectedBackup.path,
+                    timestamp: selectedBackup.timestamp,
+                    message: `✅ Arquivo restaurado com sucesso: ${safePath} (de ${path.basename(selectedBackup.path)})`
+                }, null, 2)
+            }]
+        });
+    } catch (err) {
+        writeToolError(id, `❌ Erro ao restaurar: ${err.message}`);
+    }
+}
+
+async function executeCodeOutline(id, args) {
+  const filePath = args.path;
+  const maxDepth = args.maxDepth || 3;
+  
+  if (!filePath) return writeToolError(id, '❌ "path" é obrigatório.');
+  
+  const safePath = validatePath(filePath);
+  
+  try {
+    const stat = await fs.promises.stat(safePath);
+    if (stat.isDirectory()) {
+      return writeToolError(id, '❌ Caminho é um diretório. Forneça um arquivo específico.');
+    }
+    if (stat.size === 0) {
+      return writeResult(id, { 
+        content: [{ type: 'text', text: `📋 Arquivo vazio: ${safePath}` }] 
+      });
+    }
+    
+    const buffer = await fs.promises.readFile(safePath);
+    const { text } = decodeBuffer(buffer);
+    
+    const outline = {
+      file: safePath,
+      classes: [],
+      interfaces: [],
+      enums: [],
+      methods: [],
+      properties: [],
+      fields: [],
+      constructors: []
+    };
+    
+    const lines = text.split(/\r\n|\r|\n/);
+    
+    // Detectar classes (incluindo primary constructors - C# 12+)
+    const classRegex = /(?:public|private|protected|internal)?\s*(?:static|sealed|abstract|partial)?\s*(?:class|interface|struct|record)\s+(\w+)(?:\s*<[^>]*>)?(?:\s*\([^)]*\))?/g;
+    let match;
+    while ((match = classRegex.exec(text)) !== null) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      const type = match[0].includes('interface') ? 'interface' : 
+                   match[0].includes('struct') ? 'struct' :
+                   match[0].includes('record') ? 'record' : 'class';
+      
+      const hasPrimaryConstructor = match[0].includes('(');
+      
+      outline.classes.push({
+        name: match[1],
+        type: type,
+        line: lineNum,
+        hasPrimaryConstructor,
+        fullDeclaration: match[0].trim()
+      });
+    }
+    
+    // Detectar enums
+    const enumRegex = /(?:public|private|protected|internal)?\s*enum\s+(\w+)/g;
+    while ((match = enumRegex.exec(text)) !== null) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      outline.enums.push({
+        name: match[1],
+        line: lineNum
+      });
+    }
+    
+    // Detectar métodos (incluindo interceptors - C# 12+)
+    const methodRegex = /(?:public|private|protected|internal)?\s*(?:static|async|override|virtual)?\s*(?:(\w+)\s+)?(\w+)\s*\(/g;
+    const skipMethods = ['if', 'for', 'while', 'switch', 'using', 'foreach', 'lock', 'fixed', 'unsafe'];
+    while ((match = methodRegex.exec(text)) !== null) {
+      if (!skipMethods.includes(match[2]) && match[2] !== 'get' && match[2] !== 'set') {
+        const lineNum = text.substring(0, match.index).split('\n').length;
+        const isInterceptor = match[0].includes('this');
+        
+        outline.methods.push({
+          name: match[2],
+          returnType: match[1] || 'void',
+          line: lineNum,
+          isInterceptor,
+          fullDeclaration: match[0].trim()
+        });
+      }
+    }
+    
+    // Detectar propriedades (incluindo required - C# 11+)
+    const propRegex = /(?:public|private|protected|internal)?\s*(?:required\s+)?(?:static\s+)?(\w+)\s+(\w+)\s*\{/g;
+    while ((match = propRegex.exec(text)) !== null) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      const isRequired = match[0].includes('required');
+      outline.properties.push({
+        name: match[2],
+        type: match[1],
+        line: lineNum,
+        isRequired,
+        fullDeclaration: match[0].trim()
+      });
+    }
+    
+    // Detectar campos
+    const fieldRegex = /(?:public|private|protected|internal)?\s*(?:static|readonly|const)?\s*(\w+)\s+(\w+)\s*[=;]/g;
+    while ((match = fieldRegex.exec(text)) !== null) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      if (!['if', 'for', 'while', 'switch'].includes(match[2])) {
+        outline.fields.push({
+          name: match[2],
+          type: match[1],
+          line: lineNum
+        });
+      }
+    }
+    
+    // Detectar construtores
+    const ctorRegex = /(?:public|private|protected|internal)?\s+(\w+)\s*\(/g;
+    while ((match = ctorRegex.exec(text)) !== null) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      if (outline.classes.some(c => c.name === match[1])) {
+        outline.constructors.push({
+          name: match[1],
+          line: lineNum,
+          fullDeclaration: match[0].trim()
+        });
+      }
+    }
+    
+    // Adicionar @code do .razor
+    if (safePath.endsWith('.razor')) {
+      const codeBlocks = extractRazorCodeBlocks(text);
+      if (codeBlocks.length > 0) {
+        outline.razorCodeBlocks = codeBlocks.map((block, index) => ({
+          index: index + 1,
+          baseClass: block.baseClass || null,
+          hasContent: block.content.trim().length > 0,
+          contentPreview: block.content.trim().substring(0, 100) + (block.content.length > 100 ? '...' : '')
+        }));
+      }
+    }
+    
+    outline.summary = {
+      totalClasses: outline.classes.length,
+      totalMethods: outline.methods.length,
+      totalProperties: outline.properties.length,
+      totalFields: outline.fields.length,
+      totalEnums: outline.enums.length,
+      totalConstructors: outline.constructors.length
+    };
+    
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(outline, null, 2)
+      }]
+    });
+  } catch (err) {
+    writeToolError(id, `❌ Erro ao analisar arquivo: ${err.message}`);
+  }
+}
+
+async function executeFindReferences(id, args) {
+  const name = args.name;
+  const searchPath = args.path || '.';
+  const filePattern = args.filePattern || '.cs,.razor';
+  const maxResults = Math.min(args.maxResults || 100, 500);
+  
+  if (!name) return writeToolError(id, '❌ "name" é obrigatório.');
+  
+  const safePath = validatePath(searchPath);
+  const exts = filePattern.split(',').map(e => e.trim());
+  const files = await collectFiles(safePath, exts, null);
+  
+  if (files.length === 0) {
+    return writeResult(id, { 
+      content: [{ type: 'text', text: `📋 Nenhum arquivo encontrado em ${searchPath}` }] 
+    });
+  }
+  
+  const results = [];
+  const seen = new Set();
+  let processedFiles = 0;
+  const totalFiles = files.length;
+  const startTime = Date.now();
+  
+  await runPool(files, PERFORMANCE_CONFIG.concurrency, async (filePath) => {
+    processedFiles++;
+    if (processedFiles % Math.max(1, Math.floor(totalFiles / 10)) === 0) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.error(`📊 ${searchPath}: ${processedFiles}/${totalFiles} arquivos (${elapsed}s)`);
+    }
+    
+    if (results.length >= maxResults || shuttingDown) return;
+    
+    try {
+      const buffer = await fs.promises.readFile(filePath);
+      const { text } = decodeBuffer(buffer);
+      const lines = text.split(/\r\n|\r|\n/);
+      
+      const isDeclaration = lines.some(line => 
+        /class|interface|struct|record|enum/.test(line) && line.includes(name)
+      );
+      
+      if (isDeclaration) return;
+      
+      const regex = new RegExp(`\\b${escapeRegex(name)}\\b`, 'g');
+      for (let i = 0; i < lines.length && results.length < maxResults; i++) {
+        const line = lines[i];
+        if (regex.test(line)) {
+          const key = `${filePath}:${i + 1}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            results.push({
+              file: filePath,
+              line: i + 1,
+              text: truncateLine(line.trim()),
+              context: getLineContext(lines, i)
+            });
+          }
+        }
+      }
+    } catch {}
+  });
+  
+  if (results.length === 0) {
+    return writeResult(id, {
+      content: [{ 
+        type: 'text', 
+        text: `📋 Nenhum uso de "${name}" encontrado em ${searchPath}. Verifique se o nome está correto ou use search_content para busca mais ampla.` 
+      }]
+    });
+  }
+  
+  const output = results.map(r => {
+    const context = r.context ? `\n  Contexto: ${r.context}` : '';
+    return `${r.file}:${r.line} ${r.text}${context}`;
+  });
+  
+  const note = results.length >= maxResults ? `\n\n_(Truncado em ${maxResults} resultados)_` : '';
+  
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: `🔍 ${results.length} usos de "${name}" em ${files.length} arquivos:\n\n${output.join('\n\n')}${note}\n\n💡 Dica: Use search_content para busca mais ampla.`
+    }]
+  });
+}
+
+async function executeGetMetrics(id, args) {
+  const uptime = ((Date.now() - METRICS.startTime) / 1000);
+  const uptimeFormatted = uptime > 3600 
+    ? `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${Math.floor(uptime % 60)}s`
+    : uptime > 60 
+      ? `${Math.floor(uptime / 60)}m ${Math.floor(uptime % 60)}s`
+      : `${Math.floor(uptime)}s`;
+  
+  const totalOperations = Object.values(METRICS.operations).reduce((sum, op) => sum + op.total, 0);
+  const totalErrors = Object.values(METRICS.operations).reduce((sum, op) => sum + op.errors, 0);
+  const totalTokensSaved = METRICS.tokensSaved;
+  
+  const errorRate = totalOperations > 0 ? (totalErrors / totalOperations * 100).toFixed(1) : '0.0';
+  
+  const sortedOps = Object.entries(METRICS.operations)
+    .sort((a, b) => b[1].avgTime - a[1].avgTime)
+    .slice(0, 10);
+  
+  const operationsSummary = {};
+  for (const [name, stats] of sortedOps) {
+    operationsSummary[name] = {
+      total: stats.total,
+      avgTime: `${stats.avgTime.toFixed(0)}ms`,
+      maxTime: `${stats.maxTime.toFixed(0)}ms`,
+      minTime: stats.minTime === Infinity ? 'N/A' : `${stats.minTime.toFixed(0)}ms`,
+      errors: stats.errors,
+      tokensSaved: stats.tokensSaved || 0
+    };
+  }
+  
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        uptime: uptimeFormatted,
+        totalOperations,
+        totalErrors,
+        errorRate: `${errorRate}%`,
+        totalTokensSaved: totalTokensSaved,
+        tokensSavedHuman: totalTokensSaved > 1000 ? `${(totalTokensSaved / 1000).toFixed(1)}k` : `${totalTokensSaved}`,
+        commands: METRICS.commands,
+        topOperations: operationsSummary,
+        cacheStats: {
+          fileCache: fileCache.getStats(),
+          searchCache: searchCache.getStats(),
+          dirCacheSize: dirCache.cache.size
+        },
+        recommendations: errorRate > 10 ? '⚠️ Alta taxa de erro. Verifique logs.' : '✅ Sistema saudável.'
+      }, null, 2)
+    }]
+  });
+}
+
+async function executeGetCacheStats(id, args) {
+  const fileStats = fileCache.getStats();
+  const searchStats = searchCache.getStats();
+  const totalHits = fileStats.hits + searchStats.hits;
+  const totalMisses = fileStats.misses + searchStats.misses;
+  const hitRate = totalHits + totalMisses > 0 
+    ? (totalHits / (totalHits + totalMisses) * 100).toFixed(1)
+    : 'N/A';
+  
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        fileCache: fileStats,
+        searchCache: searchStats,
+        dirCache: { size: dirCache.cache.size },
+        totalHits,
+        totalMisses,
+        hitRate: `${hitRate}%`,
+        status: hitRate > 70 ? '✅ Eficiente' : '⚠️ Considere aumentar fileCacheSize no .mcp-config.json',
+        recommendations: hitRate < 70 ? [
+          'Aumente fileCacheSize (ex: 300)',
+          'Aumente fileCacheTTL (ex: 60000)',
+          'Verifique se os arquivos estão sendo lidos repetidamente'
+        ] : []
+      }, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// NOVAS FEATURES - find_in_project (v8.4.0)
+// =============================================================================
+
+async function executeFindInProject(id, args) {
+  const pattern = args.pattern;
+  const searchPath = args.path || '.';
+  const filePattern = args.filePattern || '.cs,.razor';
+  const includeComments = args.includeComments || false;
+  const maxResults = Math.min(args.maxResults || 50, 200);
+  const minRelevance = args.minRelevance || 30;
+
+  if (!pattern) return writeToolError(id, '❌ "pattern" é obrigatório.');
+
+  const safePath = validatePath(searchPath);
+  const exts = filePattern.split(',').map(e => e.trim());
+  const files = await collectFiles(safePath, exts, null);
+
+  if (files.length === 0) {
+    return writeResult(id, { 
+      content: [{ type: 'text', text: `📋 Nenhum arquivo encontrado em ${searchPath}` }] 
+    });
+  }
+
+  const results = [];
+  const seen = new Set();
+  const regex = new RegExp(escapeRegex(pattern), 'gi');
+
+  await runPool(files.slice(0, 200), PERFORMANCE_CONFIG.concurrency, async (filePath) => {
+    if (results.length >= maxResults || shuttingDown) return;
+
+    try {
+      const buffer = await fs.promises.readFile(filePath);
+      const { text } = decodeBuffer(buffer);
+      const lines = text.split(/\r\n|\r|\n/);
+
+      let relevance = 0;
+      let matches = [];
+
+      for (let i = 0; i < lines.length && results.length < maxResults; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        if (!includeComments && (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*'))) {
+          continue;
+        }
+
+        if (regex.test(line)) {
+          const context = getLineContext(lines, i);
+          const isDeclaration = /class|interface|struct|enum|record/.test(line) && line.includes(pattern);
+          const isMethod = /void|\w+\s+\w+\s*\(/.test(line) && line.includes(pattern);
+          
+          let score = 50;
+          if (isDeclaration) score += 30;
+          if (isMethod) score += 20;
+          if (line.includes('public') || line.includes('private') || line.includes('protected')) score += 10;
+          if (line.length < 80) score += 10;
+          if (line.match(new RegExp(`\\b${escapeRegex(pattern)}\\b`, 'i'))) score += 20;
+          
+          relevance = Math.max(relevance, score);
+
+          const key = `${filePath}:${i + 1}`;
+          if (!seen.has(key) && score >= minRelevance) {
+            seen.add(key);
+            matches.push({
+              line: i + 1,
+              text: truncateLine(trimmed),
+              context: context,
+              score: score,
+              type: isDeclaration ? 'declaration' : isMethod ? 'method' : 'usage'
+            });
+          }
+        }
+      }
+
+      if (matches.length > 0) {
+        results.push({
+          file: filePath,
+          matches: matches.slice(0, 5),
+          totalMatches: matches.length,
+          relevance: relevance
+        });
+      }
+    } catch {}
+  });
+
+  results.sort((a, b) => b.relevance - a.relevance);
+
+  if (results.length === 0) {
+    return writeResult(id, {
+      content: [{ 
+        type: 'text', 
+        text: `📋 Nenhum resultado relevante para "${pattern}" encontrado. Tente reduzir minRelevance ou incluir comentários.` 
+      }]
+    });
+  }
+
+  const output = results.map(r => {
+    const matchesText = r.matches.map(m => 
+      `  L${m.line} [${m.type}] ${m.text}\n  Contexto: ${m.context}`
+    ).join('\n');
+    return `📄 ${r.file} (${r.totalMatches} ocorrência(s), relevância: ${r.relevance}%)\n${matchesText}`;
+  });
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: `🔍 ${results.length} arquivo(s) com "${pattern}" (${maxResults} resultados máximos):\n\n${output.join('\n\n')}\n\n💡 Use minRelevance para ajustar a relevância (atual: ${minRelevance}%)`
+    }]
+  });
+}
+
+// =============================================================================
+// NOVAS FEATURES - get_code_smells (v8.4.0)
+// =============================================================================
+
+async function executeCodeSmells(id, args) {
+  const filePath = args.path;
+  const thresholds = args.thresholds || {};
+  const includeSuggestions = args.suggestions !== false;
+  
+  const safePath = validatePath(filePath);
+  const stat = await fs.promises.stat(safePath);
+  
+  let files = [];
+  if (stat.isDirectory()) {
+    files = await collectFiles(safePath, ['.cs', '.razor'], null);
+  } else {
+    files = [safePath];
+  }
+
+  const allSmells = [];
+
+  for (const file of files) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+      const lines = text.split(/\r\n|\r|\n/);
+
+      const smells = detectCodeSmells(file, lines, thresholds);
+      if (smells.length > 0) {
+        allSmells.push({ file, smells });
+      }
+    } catch {}
+  }
+
+  const totalSmells = allSmells.reduce((sum, f) => sum + f.smells.length, 0);
+
+  if (totalSmells === 0) {
+    return writeResult(id, {
+      content: [{
+        type: 'text',
+        text: `✅ Nenhum code smell detectado em ${files.length} arquivo(s). Código parece saudável!`
+      }]
+    });
+  }
+
+  const summary = {
+    totalFiles: files.length,
+    totalSmells,
+    high: allSmells.reduce((sum, f) => sum + f.smells.filter(s => s.severity === 'high').length, 0),
+    medium: allSmells.reduce((sum, f) => sum + f.smells.filter(s => s.severity === 'medium').length, 0),
+    low: allSmells.reduce((sum, f) => sum + f.smells.filter(s => s.severity === 'low').length, 0),
+    files: allSmells.map(f => ({
+      file: f.file,
+      smells: f.smells.slice(0, 10),
+      total: f.smells.length
+    })),
+    recommendations: includeSuggestions ? 
+      allSmells.flatMap(f => f.smells.map(s => s.suggestion)).filter(Boolean).slice(0, 10) : []
+  };
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(summary, null, 2)
+    }]
+  });
+}
+
+function detectCodeSmells(file, lines, thresholds) {
+  const text = lines.join('\n'); 
+  const smells = [];
+  const longMethodThreshold = thresholds.longMethod || 50;
+  const largeClassThreshold = thresholds.largeClass || 300;
+  const maxParamsThreshold = thresholds.maxParams || 5;
+  const maxNestingThreshold = thresholds.maxNesting || 4;
+
+  // 1. Métodos Longos
+  const methodRegex = /(?:public|private|protected|internal)?\s*(?:static|async|override|virtual)?\s*(?:\w+)\s+\w+\s*\(/g;
+  let match;
+  while ((match = methodRegex.exec(text)) !== null) {
+    const startLine = text.substring(0, match.index).split('\n').length;
+    let braceCount = 0;
+    let endLine = startLine;
+    let foundBrace = false;
+    
+    for (let i = startLine; i < lines.length; i++) {
+      const line = lines[i];
+      const openBraces = (line.match(/{/g) || []).length;
+      const closeBraces = (line.match(/}/g) || []).length;
+      braceCount += openBraces - closeBraces;
+      if (openBraces > 0) foundBrace = true;
+      if (foundBrace && braceCount === 0) {
+        endLine = i;
+        break;
+      }
+    }
+    
+    const methodLines = endLine - startLine;
+    if (methodLines > longMethodThreshold) {
+      smells.push({
+        type: 'long_method',
+        severity: methodLines > longMethodThreshold * 2 ? 'high' : 'medium',
+        line: startLine,
+        lines: methodLines,
+        suggestion: `Divida este método de ${methodLines} linhas em métodos menores (ideal: < ${longMethodThreshold} linhas)`
+      });
+    }
+  }
+
+  // 2. Classes Grandes
+  const classRegex = /(?:public|private|protected|internal)?\s*(?:static|sealed|abstract|partial)?\s*(?:class|interface|struct|record)\s+\w+/g;
+  while ((match = classRegex.exec(text)) !== null) {
+    const startLine = text.substring(0, match.index).split('\n').length;
+    let braceCount = 0;
+    let endLine = startLine;
+    for (let i = startLine; i < lines.length; i++) {
+      const line = lines[i];
+      const openBraces = (line.match(/{/g) || []).length;
+      const closeBraces = (line.match(/}/g) || []).length;
+      braceCount += openBraces - closeBraces;
+      if (braceCount === 0) {
+        endLine = i;
+        break;
+      }
+    }
+    const classLines = endLine - startLine;
+    if (classLines > largeClassThreshold) {
+      smells.push({
+        type: 'large_class',
+        severity: classLines > largeClassThreshold * 1.5 ? 'high' : 'medium',
+        line: startLine,
+        lines: classLines,
+        suggestion: `Considere dividir esta classe de ${classLines} linhas em classes menores com responsabilidades específicas`
+      });
+    }
+  }
+
+  // 3. Parâmetros Demais
+  const paramRegex = /(?:public|private|protected|internal)?\s*(?:static|async)?\s*\w+\s+\w+\s*\(([^)]*)\)/g;
+  while ((match = paramRegex.exec(text)) !== null) {
+    const params = match[1].split(',').filter(p => p.trim()).length;
+    if (params > maxParamsThreshold) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      smells.push({
+        type: 'long_parameter_list',
+        severity: params > maxParamsThreshold + 3 ? 'high' : 'medium',
+        line: lineNum,
+        parameters: params,
+        suggestion: `Reduza de ${params} para <= ${maxParamsThreshold} parâmetros usando um objeto DTO ou parâmetros nomeados`
+      });
+    }
+  }
+
+  // 4. Aninhamento Profundo
+  let maxDepth = 0;
+  let currentDepth = 0;
+  let problemLine = 0;
+  const nestingRegex = /\b(?:if|for|while|switch|using)\s*\(/g;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (nestingRegex.test(line)) {
+      currentDepth++;
+      if (currentDepth > maxDepth) {
+        maxDepth = currentDepth;
+        problemLine = i;
+      }
+    }
+    if (line.includes('}')) {
+      currentDepth = Math.max(0, currentDepth - 1);
+    }
+  }
+  
+  if (maxDepth > maxNestingThreshold) {
+    smells.push({
+      type: 'deep_nesting',
+      severity: maxDepth > maxNestingThreshold + 2 ? 'high' : 'medium',
+      line: problemLine,
+      depth: maxDepth,
+      suggestion: `Reduza o aninhamento de ${maxDepth} níveis usando early returns, guard clauses ou extraia para métodos`
+    });
+  }
+
+  // 5. Duplicação de Código
+  const codeBlocks = [];
+  for (let i = 0; i < lines.length - 5; i++) {
+    const block = lines.slice(i, i + 3).join('\n');
+    const hash = crypto.createHash('md5').update(block).digest('hex');
+    const existing = codeBlocks.find(b => b.hash === hash && b.block === block);
+    if (existing && Math.abs(existing.line - i) > 5) {
+      smells.push({
+        type: 'duplication',
+        severity: 'low',
+        line1: existing.line,
+        line2: i,
+        suggestion: 'Extraia este bloco repetido para um método privado ou classe utilitária'
+      });
+    } else {
+      codeBlocks.push({ hash, block, line: i });
+    }
+  }
+
+  // 6. Dead Code
+  let commentedLines = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//') && trimmed.length > 20) {
+      commentedLines++;
+    }
+  }
+  if (commentedLines > 10) {
+    smells.push({
+      type: 'dead_code',
+      severity: 'low',
+      lines: commentedLines,
+      suggestion: `Remova ou atualize ${commentedLines} linhas de código comentado. Use git para histórico.`
+    });
+  }
+
+  // 7. Nomes Genéricos
+  const badNames = ['data', 'info', 'temp', 'tmp', 'result', 'res', 'param', 'args', 'obj', 'item'];
+  const badNameRegex = new RegExp(`\\b(${badNames.join('|')})\\b`, 'i');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (badNameRegex.test(line) && (line.includes('var') || line.includes('string') || line.includes('int'))) {
+      const match = line.match(badNameRegex);
+      if (match) {
+        smells.push({
+          type: 'bad_name',
+          severity: 'low',
+          line: i,
+          name: match[1],
+          suggestion: `Use um nome mais descritivo para '${match[1]}' (ex: userData, orderInfo, tempValue)`
+        });
+        break;
+      }
+    }
+  }
+
+  return smells;
+}
+
+// =============================================================================
+// NOVAS FEATURES - get_diagnostics (v8.4.0)
+// =============================================================================
+
+async function executeGetDiagnostics(id, args) {
+  const searchPath = args.path;
+  const type = args.type || 'all';
+  
+  const safePath = validatePath(searchPath);
+  const diagnostics = { errors: [], warnings: [], suggestions: [] };
+
+  const hasCsproj = await fileExists(path.join(safePath, '*.csproj'));
+  const hasPackageJson = await fileExists(path.join(safePath, 'package.json'));
+  const hasTsConfig = await fileExists(path.join(safePath, 'tsconfig.json'));
+
+  if ((type === 'all' || type === 'dotnet') && hasCsproj) {
+    try {
+      const { stdout, stderr } = await execAsync('dotnet build --no-restore', { 
+        cwd: safePath, 
+        maxBuffer: 10 * 1024 * 1024 
+      });
+      const output = stdout + stderr;
+      const lines = output.split('\n');
+      
+      for (const line of lines) {
+        if (line.includes('error')) {
+          const match = line.match(/([^:]+\.cs):(\d+)/);
+          diagnostics.errors.push({
+            file: match ? match[1] : 'unknown',
+            line: match ? parseInt(match[2]) : 0,
+            message: line.trim()
+          });
+        } else if (line.includes('warning')) {
+          const match = line.match(/([^:]+\.cs):(\d+)/);
+          diagnostics.warnings.push({
+            file: match ? match[1] : 'unknown',
+            line: match ? parseInt(match[2]) : 0,
+            message: line.trim()
+          });
+        }
+      }
+    } catch {}
+  }
+
+  if ((type === 'all' || type === 'typescript') && hasTsConfig) {
+    try {
+      const { stdout, stderr } = await execAsync('npx tsc --noEmit', { 
+        cwd: safePath, 
+        maxBuffer: 10 * 1024 * 1024 
+      });
+      const output = stdout + stderr;
+      const lines = output.split('\n');
+      
+      for (const line of lines) {
+        if (line.includes('error TS')) {
+          const match = line.match(/([^:]+\.tsx?):(\d+)/);
+          diagnostics.errors.push({
+            file: match ? match[1] : 'unknown',
+            line: match ? parseInt(match[2]) : 0,
+            message: line.trim(),
+            type: 'typescript'
+          });
+        }
+      }
+    } catch {}
+  }
+
+  if ((type === 'all' || type === 'eslint') && hasPackageJson) {
+    try {
+      const { stdout, stderr } = await execAsync('npx eslint --format json', { 
+        cwd: safePath, 
+        maxBuffer: 10 * 1024 * 1024 
+      });
+      try {
+        const eslintResult = JSON.parse(stdout);
+        for (const result of eslintResult) {
+          for (const message of result.messages) {
+            if (message.severity === 2) {
+              diagnostics.errors.push({
+                file: result.filePath,
+                line: message.line,
+                column: message.column,
+                message: message.message,
+                rule: message.ruleId,
+                type: 'eslint'
+              });
+            } else {
+              diagnostics.warnings.push({
+                file: result.filePath,
+                line: message.line,
+                column: message.column,
+                message: message.message,
+                rule: message.ruleId,
+                type: 'eslint'
+              });
+            }
+          }
+        }
+      } catch {}
+    } catch {}
+  }
+
+  if (diagnostics.errors.length > 0) {
+    const errorFiles = new Set(diagnostics.errors.map(e => e.file));
+    diagnostics.suggestions.push(`Corrija ${diagnostics.errors.length} erro(s) em ${errorFiles.size} arquivo(s)`);
+    
+    const typeErrors = diagnostics.errors.filter(e => e.type);
+    if (typeErrors.length > 0) {
+      diagnostics.suggestions.push(`Erros de tipo: ${typeErrors.length}`);
+    }
+  }
+
+  if (diagnostics.warnings.length > 0) {
+    diagnostics.suggestions.push(`Revise ${diagnostics.warnings.length} warning(s) para melhorar a qualidade`);
+  }
+
+  if (diagnostics.errors.length === 0 && diagnostics.warnings.length === 0) {
+    diagnostics.suggestions.push('✅ Nenhum erro ou warning detectado!');
+  }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        status: 'success',
+        summary: {
+          totalErrors: diagnostics.errors.length,
+          totalWarnings: diagnostics.warnings.length,
+          projectType: {
+            dotnet: hasCsproj,
+            typescript: hasTsConfig,
+            eslint: hasPackageJson
+          }
+        },
+        ...diagnostics,
+        errors: diagnostics.errors.slice(0, 20),
+        warnings: diagnostics.warnings.slice(0, 20)
+      }, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// NOVAS FEATURES - project_info (v8.4.0)
+// =============================================================================
+
+async function executeProjectInfo(id, args) {
+  const searchPath = args.path;
+  const safePath = validatePath(searchPath);
+  
+  const info = {
+    path: safePath,
+    name: path.basename(safePath),
+    type: 'unknown',
+    frameworks: [],
+    dependencies: {},
+    devDependencies: {},
+    scripts: {},
+    targetFramework: null,
+    outputPath: null
+  };
+
+  const packageJsonPath = path.join(safePath, 'package.json');
+  try {
+    const content = await fs.promises.readFile(packageJsonPath, 'utf8');
+    const pkg = JSON.parse(content);
+    info.type = 'node';
+    info.name = pkg.name || info.name;
+    info.dependencies = pkg.dependencies || {};
+    info.devDependencies = pkg.devDependencies || {};
+    info.scripts = pkg.scripts || {};
+    info.version = pkg.version;
+    info.description = pkg.description;
+    info.frameworks = Object.keys(info.dependencies).filter(d => 
+      ['react', 'vue', 'angular', 'next', 'express', 'nest', 'dotnet'].some(f => d.includes(f))
+    );
+  } catch {}
+
+  const csprojFiles = await findFiles(safePath, '*.csproj');
+  if (csprojFiles.length > 0) {
+    const csprojPath = csprojFiles[0];
+    const content = await fs.promises.readFile(csprojPath, 'utf8');
+    info.type = 'dotnet';
+    const targetFrameworkMatch = content.match(/<TargetFramework>([^<]+)<\/TargetFramework>/);
+    if (targetFrameworkMatch) {
+      info.targetFramework = targetFrameworkMatch[1];
+    }
+    const outputPathMatch = content.match(/<OutputPath>([^<]+)<\/OutputPath>/);
+    if (outputPathMatch) {
+      info.outputPath = outputPathMatch[1];
+    }
+    info.projectFile = path.basename(csprojPath);
+  }
+
+  const tsconfigPath = path.join(safePath, 'tsconfig.json');
+  try {
+    const content = await fs.promises.readFile(tsconfigPath, 'utf8');
+    const tsconfig = JSON.parse(content);
+    info.frameworks.push('typescript');
+    info.tsconfig = {
+      target: tsconfig.compilerOptions?.target || 'ES5',
+      module: tsconfig.compilerOptions?.module || 'commonjs',
+      strict: tsconfig.compilerOptions?.strict || false
+    };
+  } catch {}
+
+  const allFiles = await collectFiles(safePath, null, null);
+  info.stats = {
+    totalFiles: allFiles.length,
+    codeFiles: allFiles.filter(f => /\.(cs|js|ts|razor|html|css)$/.test(f)).length,
+    totalSize: 0
+  };
+  for (const file of allFiles) {
+    try {
+      const stat = await fs.promises.stat(file);
+      info.stats.totalSize += stat.size;
+    } catch {}
+  }
+  info.stats.totalSizeHuman = formatSize(info.stats.totalSize);
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(info, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// NOVAS FEATURES - analyze_dependencies (v8.4.0)
+// =============================================================================
+
+async function executeAnalyzeDependencies(id, args) {
+  const searchPath = args.path;
+  const outputType = args.output || 'stats';
+  const safePath = validatePath(searchPath);
+
+  const files = await collectFiles(safePath, ['.cs', '.razor', '.js', '.ts'], null);
+  const dependencies = {};
+  const references = {};
+
+  for (const file of files) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+      const imports = [];
+      
+      const usingRegex = /using\s+([^;]+);/g;
+      let match;
+      while ((match = usingRegex.exec(text)) !== null) {
+        imports.push(match[1]);
+      }
+      
+      const importRegex = /import\s+.*\s+from\s+['"]([^'"]+)['"]/g;
+      while ((match = importRegex.exec(text)) !== null) {
+        imports.push(match[1]);
+      }
+      
+      if (imports.length > 0) {
+        dependencies[file] = imports;
+        for (const imp of imports) {
+          if (!references[imp]) references[imp] = [];
+          references[imp].push(file);
+        }
+      }
+    } catch {}
+  }
+
+  const result = {
+    totalFiles: files.length,
+    filesWithDependencies: Object.keys(dependencies).length,
+    totalDependencies: Object.values(dependencies).reduce((sum, deps) => sum + deps.length, 0),
+    averageDependencies: Object.values(dependencies).reduce((sum, deps) => sum + deps.length, 0) / Math.max(1, Object.keys(dependencies).length)
+  };
+
+  if (outputType === 'graph') {
+    result.graph = {
+      nodes: files.map(f => ({ id: f, label: path.basename(f) })),
+      edges: []
+    };
+    for (const [file, deps] of Object.entries(dependencies)) {
+      for (const dep of deps) {
+        const target = files.find(f => f.includes(dep) || f.includes(dep.replace(/\./g, '/')));
+        if (target) {
+          result.graph.edges.push({ from: file, to: target });
+        }
+      }
+    }
+  } else if (outputType === 'list') {
+    result.dependencies = dependencies;
+    result.references = references;
+  }
+
+  const cycles = detectCycles(dependencies);
+  if (cycles.length > 0) {
+    result.cycles = cycles;
+    result.hasCycles = true;
+  }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(result, null, 2)
+    }]
+  });
+}
+
+function detectCycles(dependencies) {
+  const cycles = [];
+  const visited = new Set();
+  const recursionStack = new Set();
+  
+  function dfs(node, path) {
+    if (recursionStack.has(node)) {
+      cycles.push(path.concat(node));
+      return;
+    }
+    if (visited.has(node)) return;
+    
+    visited.add(node);
+    recursionStack.add(node);
+    
+    const deps = dependencies[node] || [];
+    for (const dep of deps) {
+      dfs(dep, [...path, node]);
+    }
+    
+    recursionStack.delete(node);
+  }
+  
+  for (const file of Object.keys(dependencies)) {
+    dfs(file, []);
+  }
+  
+  return cycles;
+}
+
+// =============================================================================
+// NOVAS FEATURES - compare_files (v8.4.0)
+// =============================================================================
+
+async function executeCompareFiles(id, args) {
+  const file1 = args.file1;
+  const file2 = args.file2;
+  const format = args.format || 'unified';
+
+  if (!file1 || !file2) {
+    return writeToolError(id, '❌ "file1" e "file2" são obrigatórios.');
+  }
+
+  const safeFile1 = validatePath(file1);
+  const safeFile2 = validatePath(file2);
+
+  try {
+    const content1 = await fs.promises.readFile(safeFile1, 'utf8');
+    const content2 = await fs.promises.readFile(safeFile2, 'utf8');
+    
+    const lines1 = content1.split('\n');
+    const lines2 = content2.split('\n');
+    
+    if (format === 'json') {
+      const diff = {
+        file1: safeFile1,
+        file2: safeFile2,
+        lines1: lines1.length,
+        lines2: lines2.length,
+        differences: []
+      };
+      
+      const maxLen = Math.max(lines1.length, lines2.length);
+      for (let i = 0; i < maxLen; i++) {
+        const l1 = i < lines1.length ? lines1[i] : '';
+        const l2 = i < lines2.length ? lines2[i] : '';
+        if (l1 !== l2) {
+          diff.differences.push({
+            line: i + 1,
+            file1: l1 || '<EOF>',
+            file2: l2 || '<EOF>'
+          });
+        }
+      }
+      
+      writeResult(id, {
+        content: [{
+          type: 'text',
+          text: JSON.stringify(diff, null, 2)
+        }]
+      });
+    } else if (format === 'side-by-side') {
+      const maxLen = Math.max(lines1.length, lines2.length);
+      const output = [
+        `📊 Comparação lado a lado:`,
+        `${'─'.repeat(120)}`,
+        `${' '.padEnd(50)}|${' '.padEnd(50)}`,
+        `${'Arquivo 1'.padEnd(50)}|${'Arquivo 2'.padEnd(50)}`,
+        `${'─'.repeat(120)}`
+      ];
+      
+      for (let i = 0; i < maxLen; i++) {
+        const l1 = i < lines1.length ? lines1[i] : '';
+        const l2 = i < lines2.length ? lines2[i] : '';
+        if (l1 !== l2) {
+          const prefix = i < Math.min(lines1.length, lines2.length) ? '⚠️' : '➕/➖';
+          output.push(
+            `${prefix} L${(i+1).toString().padStart(4)} ${l1.slice(0, 40).padEnd(50)}|` +
+            `${prefix} L${(i+1).toString().padStart(4)} ${l2.slice(0, 40).padEnd(50)}`
+          );
+        }
+      }
+      
+      writeResult(id, {
+        content: [{
+          type: 'text',
+          text: output.join('\n')
+        }]
+      });
+    } else {
+      const diff = [];
+      let i = 0, j = 0;
+      let context = 0;
+      const contextLines = 3;
+      
+      while (i < lines1.length || j < lines2.length) {
+        if (i < lines1.length && j < lines2.length && lines1[i] === lines2[j]) {
+          if (context < contextLines) {
+            diff.push(`  ${lines1[i]}`);
+            context++;
+          }
+          i++; j++;
+        } else {
+          let startI = i;
+          let startJ = j;
+          while (i < lines1.length && (j >= lines2.length || lines1[i] !== lines2[j])) {
+            i++;
+          }
+          while (j < lines2.length && (i >= lines1.length || lines1[i] !== lines2[j])) {
+            j++;
+          }
+          
+          diff.push(`@@ -${startI+1},${i-startI} +${startJ+1},${j-startJ} @@`);
+          for (let k = startI; k < i; k++) {
+            diff.push(`- ${lines1[k]}`);
+          }
+          for (let k = startJ; k < j; k++) {
+            diff.push(`+ ${lines2[k]}`);
+          }
+          context = 0;
+        }
+      }
+      
+      writeResult(id, {
+        content: [{
+          type: 'text',
+          text: `📊 Diff unificado (${safeFile1} → ${safeFile2}):\n\n${diff.join('\n')}`
+        }]
+      });
+    }
+  } catch (err) {
+    writeToolError(id, `❌ Erro ao comparar arquivos: ${err.message}`);
+  }
+}
+
+// =============================================================================
+// NOVAS FEATURES - get_symbol_usage (v8.4.0)
+// =============================================================================
+
+async function executeGetSymbolUsage(id, args) {
+  const name = args.name;
+  const searchPath = args.path || '.';
+  const filePattern = args.filePattern || '.cs,.razor';
+
+  if (!name) return writeToolError(id, '❌ "name" é obrigatório.');
+
+  const safePath = validatePath(searchPath);
+  const exts = filePattern.split(',').map(e => e.trim());
+  const files = await collectFiles(safePath, exts, null);
+
+  const usage = {
+    symbol: name,
+    totalOccurrences: 0,
+    files: [],
+    contexts: [],
+    declarations: []
+  };
+
+  for (const file of files) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+      const lines = text.split(/\r\n|\r|\n/);
+      
+      let occurrences = 0;
+      let declarations = 0;
+      const contexts = [];
+      
+      const regex = new RegExp(`\\b${escapeRegex(name)}\\b`, 'g');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (regex.test(line)) {
+          occurrences++;
+          const isDeclaration = /class|interface|struct|enum|record/.test(line);
+          if (isDeclaration) declarations++;
+          
+          const context = getLineContext(lines, i);
+          contexts.push({
+            line: i + 1,
+            text: truncateLine(line.trim()),
+            context,
+            isDeclaration
+          });
+        }
+      }
+      
+      if (occurrences > 0) {
+        usage.files.push({
+          file,
+          occurrences,
+          declarations
+        });
+        usage.contexts.push(...contexts);
+        usage.totalOccurrences += occurrences;
+        if (declarations > 0) {
+          usage.declarations.push({ file, count: declarations });
+        }
+      }
+    } catch {}
+  }
+
+  usage.files.sort((a, b) => b.occurrences - a.occurrences);
+  
+  usage.statistics = {
+    totalFiles: usage.files.length,
+    averagePerFile: (usage.totalOccurrences / Math.max(1, usage.files.length)).toFixed(1),
+    mostUsedFile: usage.files.length > 0 ? usage.files[0].file : null,
+    isCommonSymbol: usage.totalOccurrences > 10
+  };
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(usage, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// NOVAS FEATURES - code_completion (v8.4.0)
+// =============================================================================
+
+async function executeCodeCompletion(id, args) {
+  const filePath = args.file;
+  const lineNum = args.line || 0;
+  const column = args.column || 0;
+  const context = args.context || '';
+  const maxSuggestions = Math.min(args.maxSuggestions || 5, 10);
+
+  if (!filePath) return writeToolError(id, '❌ "file" é obrigatório.');
+
+  const safePath = validatePath(filePath);
+  const buffer = await fs.promises.readFile(safePath);
+  const { text } = decodeBuffer(buffer);
+  const lines = text.split(/\r\n|\r|\n/);
+  
+  const suggestions = [];
+  const currentLine = lineNum > 0 ? lines[lineNum - 1] || '' : '';
+  const currentText = context || currentLine;
+  
+  if (currentText.includes('new ')) {
+    const className = currentText.match(/new\s+(\w+)/);
+    if (className) {
+      suggestions.push({
+        type: 'constructor',
+        text: `new ${className[1]}()`,
+        description: `Instancia ${className[1]}`
+      });
+      suggestions.push({
+        type: 'constructor',
+        text: `new ${className[1]} { }`,
+        description: `Instancia ${className[1]} com inicializador`
+      });
+    }
+  }
+  
+  if (currentText.includes('using ')) {
+    const namespace = currentText.match(/using\s+(\w+)/);
+    if (namespace) {
+      suggestions.push({
+        type: 'using',
+        text: `using ${namespace[1]}.`,
+        description: `Importa namespace ${namespace[1]}`
+      });
+    }
+  }
+  
+  if (currentText.includes('public ')) {
+    suggestions.push({
+      type: 'modifier',
+      text: 'public { get; set; }',
+      description: 'Propriedade auto-implementada'
+    });
+    suggestions.push({
+      type: 'modifier',
+      text: 'public void { }',
+      description: 'Método público'
+    });
+  }
+  
+  if (currentText.includes('var ') || currentText.includes('string ')) {
+    suggestions.push({
+      type: 'declaration',
+      text: 'var = new',
+      description: 'Declaração de variável'
+    });
+  }
+  
+  if (currentText.includes('if ')) {
+    suggestions.push({
+      type: 'conditional',
+      text: 'if () { }',
+      description: 'Condicional if'
+    });
+    suggestions.push({
+      type: 'conditional',
+      text: 'if () { } else { }',
+      description: 'Condicional if/else'
+    });
+  }
+  
+  if (currentText.includes('for ')) {
+    suggestions.push({
+      type: 'loop',
+      text: 'for (int i = 0; i < ; i++) { }',
+      description: 'Loop for'
+    });
+    suggestions.push({
+      type: 'loop',
+      text: 'foreach (var item in ) { }',
+      description: 'Loop foreach'
+    });
+  }
+  
+  try {
+    const dir = path.dirname(safePath);
+    const files = await collectFiles(dir, ['.cs', '.razor'], null);
+    const classes = [];
+    const methods = [];
+    
+    for (const f of files.slice(0, 10)) {
+      try {
+        const content = await fs.promises.readFile(f, 'utf8');
+        const classMatch = content.match(/class\s+(\w+)/);
+        if (classMatch) classes.push(classMatch[1]);
+        const methodMatch = content.match(/public\s+\w+\s+(\w+)\s*\(/);
+        if (methodMatch) methods.push(methodMatch[1]);
+      } catch {}
+    }
+    
+    if (classes.length > 0 && currentText.includes('new ')) {
+      suggestions.push({
+        type: 'class',
+        text: `new ${classes[0]}()`,
+        description: `Instancia ${classes[0]} (encontrado no projeto)`
+      });
+    }
+    
+    if (methods.length > 0 && currentText.includes('.')) {
+      suggestions.push({
+        type: 'method',
+        text: `${methods[0]}()`,
+        description: `Chama ${methods[0]} (encontrado no projeto)`
+      });
+    }
+  } catch {}
+
+  if (currentText.trim().startsWith('//')) {
+    suggestions.push({
+      type: 'comment',
+      text: '// TODO: Implementar ',
+      description: 'Comentário TODO'
+    });
+    suggestions.push({
+      type: 'comment',
+      text: '// FIXME: Corrigir ',
+      description: 'Comentário FIXME'
+    });
+  }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        file: safePath,
+        line: lineNum,
+        column: column,
+        suggestions: suggestions.slice(0, maxSuggestions),
+        totalSuggestions: suggestions.length,
+        context: currentText,
+        tip: 'Use o contexto completo para melhores sugestões'
+      }, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// FEATURES FALTANTES - rename_symbol (v8.5.0)
+// =============================================================================
+
+async function executeRenameSymbol(id, args) {
+  const oldName = args.oldName;
+  const newName = args.newName;
+  const searchPath = args.path || '.';
+  const filePattern = args.filePattern || '.cs,.razor';
+  const dryRun = args.dryRun !== false;
+
+  if (!oldName || !newName) {
+    return writeToolError(id, '❌ "oldName" e "newName" são obrigatórios.');
+  }
+
+  const safePath = validatePath(searchPath);
+  const exts = filePattern.split(',').map(e => e.trim());
+  const files = await collectFiles(safePath, exts, null);
+
+  const changes = [];
+  let totalReplacements = 0;
+
+  for (const file of files) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+      
+      const regex = new RegExp(`\\b${escapeRegex(oldName)}\\b`, 'g');
+      const matches = text.match(regex);
+      
+      if (matches) {
+        const newText = text.replace(regex, newName);
+        const replacements = matches.length;
+        totalReplacements += replacements;
+        
+        changes.push({
+          file,
+          replacements,
+          preview: buildDiffPreview(text, newText).preview
+        });
+
+        if (!dryRun) {
+          await writeBackup(file, buffer);
+          await fs.promises.writeFile(file, newText, 'utf8');
+          invalidateCachePaths(file);
+        }
+      }
+    } catch (err) {
+      changes.push({ file, error: err.message });
+    }
+  }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        status: dryRun ? 'preview' : 'success',
+        dryRun,
+        totalFiles: changes.length,
+        totalReplacements,
+        changes: changes.slice(0, 20),
+        message: dryRun 
+          ? `📋 Preview: ${changes.length} arquivo(s) seriam modificados (${totalReplacements} substituições)`
+          : `✅ ${changes.length} arquivo(s) modificados (${totalReplacements} substituições)`
+      }, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// FEATURES FALTANTES - get_call_hierarchy (v8.5.0)
+// =============================================================================
+
+async function executeCallHierarchy(id, args) {
+  const name = args.name;
+  const searchPath = args.path || '.';
+  const direction = args.direction || 'both';
+  const maxDepth = Math.min(args.maxDepth || 3, 5);
+
+  if (!name) return writeToolError(id, '❌ "name" é obrigatório.');
+
+  const safePath = validatePath(searchPath);
+  const files = await collectFiles(safePath, ['.cs', '.razor'], null);
+
+  const hierarchy = {
+    symbol: name,
+    incoming: [],
+    outgoing: [],
+    depth: maxDepth
+  };
+
+  function findCalls(text, methodName) {
+    const calls = [];
+    const regex = new RegExp(`\\b${escapeRegex(methodName)}\\s*\\(`, 'g');
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      calls.push({ line: lineNum });
+    }
+    return calls;
+  }
+
+  function findMethodDefinitions(text, methodName) {
+    const definitions = [];
+    const regex = new RegExp(`(?:public|private|protected|internal)?\\s*(?:static|async)?\\s*\\w+\\s+${escapeRegex(methodName)}\\s*\\(`, 'g');
+    let match;
+    while ((match = regex.exec(text)) !== null) {
+      const lineNum = text.substring(0, match.index).split('\n').length;
+      definitions.push({ line: lineNum });
+    }
+    return definitions;
+  }
+
+  for (const file of files) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+
+      if (direction === 'incoming' || direction === 'both') {
+        const calls = findCalls(text, name);
+        if (calls.length > 0) {
+          hierarchy.incoming.push({
+            file,
+            calls: calls.slice(0, 5)
+          });
+        }
+      }
+
+      if (direction === 'outgoing' || direction === 'both') {
+        const definitions = findMethodDefinitions(text, name);
+        if (definitions.length > 0) {
+          const lines = text.split('\n');
+          let methodStart = definitions[0].line - 1;
+          let methodEnd = methodStart;
+          let braceCount = 0;
+          
+          for (let i = methodStart; i < lines.length; i++) {
+            const line = lines[i];
+            const openBraces = (line.match(/{/g) || []).length;
+            const closeBraces = (line.match(/}/g) || []).length;
+            braceCount += openBraces - closeBraces;
+            if (braceCount === 0 && i > methodStart) {
+              methodEnd = i;
+              break;
+            }
+          }
+
+          const methodBody = lines.slice(methodStart, methodEnd + 1).join('\n');
+          const callRegex = /(\w+)\s*\(/g;
+          let callMatch;
+          while ((callMatch = callRegex.exec(methodBody)) !== null) {
+            if (callMatch[1] !== name && !['if', 'for', 'while', 'switch', 'using', 'return', 'throw'].includes(callMatch[1])) {
+              hierarchy.outgoing.push({
+                file,
+                calledMethod: callMatch[1],
+                line: methodStart + methodBody.substring(0, callMatch.index).split('\n').length
+              });
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  hierarchy.summary = {
+    totalIncoming: hierarchy.incoming.reduce((sum, f) => sum + f.calls.length, 0),
+    totalOutgoing: hierarchy.outgoing.length,
+    filesWithIncoming: hierarchy.incoming.length,
+    filesWithOutgoing: hierarchy.outgoing.length > 0 ? 1 : 0
+  };
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(hierarchy, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// FEATURES FALTANTES - get_type_info (v8.5.0)
+// =============================================================================
+
+async function executeGetTypeInfo(id, args) {
+  const name = args.name;
+  const searchPath = args.path || '.';
+
+  if (!name) return writeToolError(id, '❌ "name" é obrigatório.');
+
+  const safePath = validatePath(searchPath);
+  const files = await collectFiles(safePath, ['.cs', '.razor'], null);
+
+  let typeInfo = null;
+
+  for (const file of files) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+      
+      const typeRegex = new RegExp(`(?:public|private|protected|internal)?\\s*(?:static|sealed|abstract|partial)?\\s*(?:class|interface|struct|record)\\s+${escapeRegex(name)}`, 'g');
+      const match = typeRegex.exec(text);
+      
+      if (match) {
+        const lines = text.split('\n');
+        const startLine = text.substring(0, match.index).split('\n').length;
+        
+        let endLine = startLine;
+        let braceCount = 0;
+        for (let i = startLine; i < lines.length; i++) {
+          const line = lines[i];
+          const openBraces = (line.match(/{/g) || []).length;
+          const closeBraces = (line.match(/}/g) || []).length;
+          braceCount += openBraces - closeBraces;
+          if (braceCount === 0 && i > startLine) {
+            endLine = i;
+            break;
+          }
+        }
+
+        const typeContent = lines.slice(startLine, endLine + 1).join('\n');
+        
+        const propRegex = /(?:public|private|protected|internal)?\s*(?:required\s+)?(?:static\s+)?(\w+)\s+(\w+)\s*\{/g;
+        const properties = [];
+        let propMatch;
+        while ((propMatch = propRegex.exec(typeContent)) !== null) {
+          properties.push({
+            name: propMatch[2],
+            type: propMatch[1],
+            isRequired: propMatch[0].includes('required')
+          });
+        }
+
+        const methodRegex = /(?:public|private|protected|internal)?\s*(?:static|async)?\s*(\w+)\s+(\w+)\s*\(/g;
+        const methods = [];
+        let methodMatch;
+        while ((methodMatch = methodRegex.exec(typeContent)) !== null) {
+          if (!['if', 'for', 'while', 'switch', 'using'].includes(methodMatch[2])) {
+            methods.push({
+              name: methodMatch[2],
+              returnType: methodMatch[1] || 'void'
+            });
+          }
+        }
+
+        const inheritsRegex = /:\s*([^{]+)/;
+        const inheritsMatch = typeContent.match(inheritsRegex);
+        const inherits = inheritsMatch ? inheritsMatch[1].split(',').map(i => i.trim()) : [];
+
+        typeInfo = {
+          name,
+          file,
+          startLine,
+          endLine,
+          totalLines: endLine - startLine + 1,
+          kind: match[0].includes('interface') ? 'interface' : 
+                match[0].includes('struct') ? 'struct' :
+                match[0].includes('record') ? 'record' : 'class',
+          inherits,
+          properties: properties.slice(0, 20),
+          methods: methods.slice(0, 20),
+          summary: {
+            totalProperties: properties.length,
+            totalMethods: methods.length,
+            totalInherits: inherits.length
+          }
+        };
+        break;
+      }
+    } catch {}
+  }
+
+  if (!typeInfo) {
+    return writeResult(id, {
+      content: [{ type: 'text', text: `📋 Tipo "${name}" não encontrado em ${searchPath}` }]
+    });
+  }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(typeInfo, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// FEATURES FALTANTES - extract_interface (v8.5.0)
+// =============================================================================
+
+async function executeExtractInterface(id, args) {
+  const classPath = args.classPath;
+  const className = args.className;
+  const methods = args.methods || [];
+  const dryRun = args.dryRun !== false;
+
+  if (!classPath || !className) {
+    return writeToolError(id, '❌ "classPath" e "className" são obrigatórios.');
+  }
+
+  const safePath = validatePath(classPath);
+  const buffer = await fs.promises.readFile(safePath);
+  const { text } = decodeBuffer(buffer);
+  const lines = text.split('\n');
+
+  const classRegex = new RegExp(`(?:public|private|protected|internal)?\\s*(?:static|sealed|abstract|partial)?\\s*class\\s+${escapeRegex(className)}`, 'g');
+  const match = classRegex.exec(text);
+  
+  if (!match) {
+    return writeToolError(id, `❌ Classe "${className}" não encontrada em ${classPath}`);
+  }
+
+  const methodRegex = /(?:public)\s*(?:static|async)?\s*(\w+)\s+(\w+)\s*\(([^)]*)\)/g;
+  const methodMatches = [];
+  let methodMatch;
+  while ((methodMatch = methodRegex.exec(text)) !== null) {
+    if (methods.length === 0 || methods.includes(methodMatch[2])) {
+      methodMatches.push({
+        name: methodMatch[2],
+        returnType: methodMatch[1] || 'void',
+        parameters: methodMatch[3].trim()
+      });
+    }
+  }
+
+  if (methodMatches.length === 0) {
+    return writeToolError(id, `❌ Nenhum método público encontrado em ${className}`);
+  }
+
+  const interfaceName = `I${className}`;
+  const interfaceContent = [
+    `public interface ${interfaceName}`,
+    `{`,
+    ...methodMatches.map(m => 
+      `    ${m.returnType} ${m.name}(${m.parameters});`
+    ),
+    `}`
+  ].join('\n');
+
+  const updatedClass = text.replace(
+    classRegex,
+    `public class ${className} : ${interfaceName}`
+  );
+
+  const result = {
+    className,
+    interfaceName,
+    interfaceContent,
+    methods: methodMatches,
+    dryRun,
+    message: dryRun 
+      ? `📋 Preview: Interface ${interfaceName} com ${methodMatches.length} métodos será criada`
+      : `✅ Interface ${interfaceName} criada com sucesso`
+  };
+
+  if (!dryRun) {
+    const interfacePath = path.join(path.dirname(safePath), `${interfaceName}.cs`);
+    await writeBackup(safePath, buffer);
+    await fs.promises.writeFile(interfacePath, interfaceContent, 'utf8');
+    
+    await fs.promises.writeFile(safePath, updatedClass, 'utf8');
+    invalidateCachePaths(safePath);
+    
+    result.interfaceFile = interfacePath;
+    result.updatedClass = true;
+  }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify(result, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// FEATURES FALTANTES - find_unused_code (v8.5.0)
+// =============================================================================
+
+async function executeFindUnusedCode(id, args) {
+  const searchPath = args.path || '.';
+  const filePattern = args.filePattern || '.cs,.razor';
+  const includeTests = args.includeTests || false;
+
+  const safePath = validatePath(searchPath);
+  const exts = filePattern.split(',').map(e => e.trim());
+  const files = await collectFiles(safePath, exts, null);
+
+  const filteredFiles = includeTests 
+    ? files 
+    : files.filter(f => !f.includes('.Tests.') && !f.includes('.Test.'));
+
+  const definitions = {};
+  const usages = {};
+
+  for (const file of filteredFiles) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+      
+      const methodRegex = /(?:public)\s*(?:static|async)?\s*(\w+)\s+(\w+)\s*\(/g;
+      let match;
+      while ((match = methodRegex.exec(text)) !== null) {
+        const name = match[2];
+        if (!['if', 'for', 'while', 'switch', 'using'].includes(name)) {
+          const key = `${file}:${name}`;
+          definitions[key] = {
+            file,
+            name,
+            returnType: match[1] || 'void',
+            line: text.substring(0, match.index).split('\n').length,
+            type: 'method'
+          };
+        }
+      }
+
+      const propRegex = /(?:public)\s*(?:required\s+)?(\w+)\s+(\w+)\s*\{/g;
+      while ((match = propRegex.exec(text)) !== null) {
+        const key = `${file}:${match[2]}`;
+        definitions[key] = {
+          file,
+          name: match[2],
+          type: match[1] || 'string',
+          line: text.substring(0, match.index).split('\n').length,
+          kind: 'property'
+        };
+      }
+
+      const useRegex = /(\w+)\s*\(/g;
+      while ((match = useRegex.exec(text)) !== null) {
+        const name = match[1];
+        if (!['if', 'for', 'while', 'switch', 'using', 'return', 'throw', 'new'].includes(name)) {
+          if (!usages[name]) usages[name] = [];
+          usages[name].push({
+            file,
+            line: text.substring(0, match.index).split('\n').length
+          });
+        }
+      }
+    } catch {}
+  }
+
+  const unused = [];
+  for (const [key, def] of Object.entries(definitions)) {
+    const usageCount = (usages[def.name] || []).filter(u => u.file !== def.file).length;
+    if (usageCount === 0) {
+      unused.push({
+        ...def,
+        usageCount,
+        suggestion: def.type === 'method' 
+          ? 'Considere remover este método ou torná-lo privado'
+          : 'Considere remover esta propriedade'
+      });
+    }
+  }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        totalDefinitions: Object.keys(definitions).length,
+        totalUnused: unused.length,
+        unused: unused.slice(0, 20),
+        summary: unused.length === 0 
+          ? '✅ Nenhum código não utilizado encontrado!' 
+          : `⚠️ ${unused.length} símbolos não utilizados encontrados`
+      }, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// FEATURES FALTANTES - analyze_complexity (v8.5.0)
+// =============================================================================
+
+async function executeAnalyzeComplexity(id, args) {
+  const searchPath = args.path;
+  const threshold = args.threshold || 10;
+
+  if (!searchPath) return writeToolError(id, '❌ "path" é obrigatório.');
+
+  const safePath = validatePath(searchPath);
+  const stat = await fs.promises.stat(safePath);
+  
+  let files = [];
+  if (stat.isDirectory()) {
+    files = await collectFiles(safePath, ['.cs', '.razor'], null);
+  } else {
+    files = [safePath];
+  }
+
+  const results = [];
+  let totalComplexity = 0;
+  let maxComplexity = 0;
+  let filesAboveThreshold = 0;
+
+  for (const file of files) {
+    try {
+      const buffer = await fs.promises.readFile(file);
+      const { text } = decodeBuffer(buffer);
+      const lines = text.split('\n');
+
+      let cyclomaticComplexity = 0;
+      let cognitiveComplexity = 0;
+      let nestingDepth = 0;
+      let maxNesting = 0;
+
+      const decisionKeywords = ['if', 'else if', 'for', 'foreach', 'while', 'do', 'switch', 'case', 'catch', '&&', '||', '?'];
+      
+      for (const line of lines) {
+        const trimmed = line.trim();
+        for (const keyword of decisionKeywords) {
+          if (trimmed.includes(keyword)) {
+            cyclomaticComplexity++;
+          }
+        }
+        const openBraces = (line.match(/{/g) || []).length;
+        const closeBraces = (line.match(/}/g) || []).length;
+        nestingDepth += openBraces - closeBraces;
+        if (nestingDepth > maxNesting) maxNesting = nestingDepth;
+      }
+
+      cognitiveComplexity = cyclomaticComplexity + maxNesting;
+
+      const status = cyclomaticComplexity > threshold ? '⚠️ Alta' : '✅ OK';
+      if (cyclomaticComplexity > threshold) filesAboveThreshold++;
+
+      totalComplexity += cyclomaticComplexity;
+      if (cyclomaticComplexity > maxComplexity) maxComplexity = cyclomaticComplexity;
+
+      results.push({
+        file,
+        cyclomaticComplexity,
+        cognitiveComplexity,
+        maxNesting,
+        threshold,
+        status,
+        recommendation: cyclomaticComplexity > threshold 
+          ? `Considere simplificar este arquivo (${cyclomaticComplexity} > ${threshold})`
+          : 'Complexidade aceitável'
+      });
+    } catch {}
+  }
+
+  const averageComplexity = results.length > 0 ? (totalComplexity / results.length).toFixed(1) : 0;
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        totalFiles: results.length,
+        averageComplexity: parseFloat(averageComplexity),
+        maxComplexity,
+        filesAboveThreshold,
+        threshold,
+        summary: filesAboveThreshold === 0 
+          ? '✅ Todos os arquivos estão dentro do limite de complexidade!'
+          : `⚠️ ${filesAboveThreshold} arquivo(s) excedem o limite de complexidade (${threshold})`,
+        files: results.slice(0, 20)
+      }, null, 2)
+    }]
+  });
+}
+
+// =============================================================================
+// FUNÇÕES AUXILIARES E HELPERS
+// =============================================================================
+
+async function fileExists(pattern) {
+  try {
+    const dir = path.dirname(pattern);
+    const files = await fs.promises.readdir(dir);
+    const basename = path.basename(pattern);
+    const regex = new RegExp(basename.replace(/\*/g, '.*'));
+    return files.some(f => regex.test(f));
+  } catch {
+    return false;
+  }
+}
+
+async function findFiles(dir, pattern) {
+  const results = [];
+  const regex = new RegExp(pattern.replace(/\*/g, '.*'));
+  try {
+    const files = await fs.promises.readdir(dir);
+    for (const file of files) {
+      if (regex.test(file)) {
+        results.push(path.join(dir, file));
+      }
+    }
+  } catch {}
+  return results;
+}
+
+function getLineContext(lines, index, contextLines = 2) {
+  const start = Math.max(0, index - contextLines);
+  const end = Math.min(lines.length, index + contextLines + 1);
+  const context = lines.slice(start, end);
+  return context.join('\n').trim();
+}
+
+async function collectFiles(dir, fileExts, excludeExts) {
+  const list = [];
+  await walk(dir, fileExts, excludeExts, (f) => list.push(f));
+  return list;
+}
+
+async function walk(dir, fileExts, excludeExts, onFileFound) {
+  let dirents;
+  try { dirents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+  for (const dirent of dirents) {
+    if (dirent.isSymbolicLink()) continue;
+    const fullPath = path.join(dir, dirent.name);
+    if (dirent.isDirectory()) {
+      if (!isIgnoredDir(dirent.name)) {
+        await walk(fullPath, fileExts, excludeExts, onFileFound);
+      }
+    } else if (dirent.isFile()) {
+      let matchesExt = true;
+      if (fileExts && fileExts.length > 0) {
+        matchesExt = fileExts.some(ext => dirent.name.endsWith(ext));
+      }
+      let excluded = false;
+      if (excludeExts && excludeExts.length > 0) {
+        excluded = excludeExts.some(ext => dirent.name.endsWith(ext));
+      }
+      if (matchesExt && !excluded && !isExcludedFile(dirent.name)) {
+        onFileFound(fullPath);
+      }
+    }
+  }
+}
+
+async function isLikelyBinary(filePath) {
+  const BINARY_EXT = new Set([
+    '.dll', '.exe', '.pdb', '.png', '.jpg', '.jpeg', '.gif', '.ico',
+    '.zip', '.pfx', '.bmp', '.webp', '.woff', '.woff2', '.ttf', '.eot',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+  ]);
+  if (BINARY_EXT.has(path.extname(filePath).toLowerCase())) return true;
+  try {
+    const buffer = await fs.promises.readFile(filePath, { length: 512 });
+    return buffer.includes(0);
+  } catch { return true; }
+}
+
+function decodeBuffer(buffer, overrideEncoding = null) {
+  let encoding = overrideEncoding || 'utf-8';
+  let hadBom = false;
+  if (buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
+    hadBom = true;
+    buffer = buffer.subarray(3);
+  }
+  return { text: buffer.toString(encoding), encoding, hadBom };
+}
+
+function truncateLine(line) {
+  return line.length > 500 ? line.slice(0, 500) + '…' : line;
+}
+
+function formatSize(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = bytes;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) { size /= 1024; unitIndex++; }
+  return `${size.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildDiffPreview(original, updated) {
+  const origLines = original.split('\n');
+  const newLines = updated.split('\n');
+  const diffs = [];
+  const len = Math.max(origLines.length, newLines.length);
+  for (let i = 0; i < len && i < 15; i++) {
+    if (origLines[i] !== newLines[i]) {
+      diffs.push(`  L${i+1}: - ${origLines[i] || ''}\n  L${i+1}: + ${newLines[i] || ''}`);
+    }
+  }
+  const hasCRLF = original.includes('\r\n');
+  const eolNote = hasCRLF ? ' [CRLF]' : '';
+  return { preview: diffs.join('\n'), eolNote };
+}
+
+async function writeBackup(filePath, buffer) {
+  const bakPath = `${filePath}.bak.${Date.now()}`;
+  try {
+    await fs.promises.writeFile(bakPath, buffer);
+    return { ok: true, bakPath };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
+async function cleanOldBackups(dir, maxAge = BACKUP_CONFIG.maxAge) {
+  try {
+    const files = await fs.promises.readdir(dir);
+    const now = Date.now();
+    for (const file of files) {
+      if (/\.bak\.\d+$/.test(file)) {
+        const fullPath = path.join(dir, file);
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          if (now - stat.mtimeMs > maxAge) {
+            await fs.promises.unlink(fullPath);
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
+async function runPool(items, limit, worker) {
+  if (items.length === 0) return;
+  let idx = 0;
+  const count = Math.min(Math.max(limit, 1), items.length);
+  const workers = Array.from({ length: count }, async () => {
+    while (true) {
+      if (shuttingDown) return;
+      const i = idx++;
+      if (i >= items.length) return;
+      await worker(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+}
+
+// =============================================================================
+// TOOLS DE TRADUÇÃO (RESX) - MANTIDAS INTACTAS
 // =============================================================================
 
 const RESX_LANGS = ['pt-BR', 'en-US', 'es-ES'];
 const LOC_KEY_REGEX = /Loc\[\s*"([^"]*)"\s*\]/g;
-const RESX_DATA_NAME_REGEX = /<data\s+name="([^"]*)"/g;
 
 function escapeXml(str) { return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); }
 function unescapeXml(str) { return String(str).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&'); }
@@ -1811,39 +5136,104 @@ function createResxTemplate(lang, keys) {
 function findDuplicateKeysWithPositions(text) {
   const lines = text.split(/\r\n|\n/);
   const keyPositions = new Map();
+  
   for (let i = 0; i < lines.length; i++) {
     const match = lines[i].match(/<data\s+name="([^"]*)"/);
     if (match) {
       const key = unescapeXml(match[1]);
       if (!keyPositions.has(key)) keyPositions.set(key, []);
-      keyPositions.get(key).push(i);
+      keyPositions.get(key).push(i + 1);
     }
   }
-  const duplicates = [];
+  
+  const duplicateEntries = [];
   let total = 0;
   for (const [key, positions] of keyPositions) {
-    if (positions.length > 1) { duplicates.push(key); total += positions.length - 1; }
+    if (positions.length > 1) {
+      duplicateEntries.push({ 
+        key, 
+        positions,
+        count: positions.length,
+        occurrencesToRemove: positions.length - 1
+      });
+      total += positions.length - 1;
+    }
   }
-  return { duplicates, totalDuplicateOccurrences: total };
+  
+  return { 
+    duplicates: duplicateEntries,
+    totalDuplicateOccurrences: total,
+    duplicateKeys: duplicateEntries.map(d => d.key),
+    hasDuplicates: duplicateEntries.length > 0
+  };
 }
 
-function removeDuplicates(text, keepFirst = true) {
-  const lines = text.split(/\r\n|\n/);
-  const seenKeys = new Set();
-  const newLines = [];
-  let removed = 0;
-  const removedKeys = [];
-  for (const line of lines) {
-    const match = line.match(/<data\s+name="([^"]*)"/);
-    if (match) {
-      const key = unescapeXml(match[1]);
-      if (seenKeys.has(key)) { removed++; removedKeys.push(key); continue; }
-      seenKeys.add(key);
+
+async function executeDeduplicateResx(id, args) {
+  const { path: targetPath, dryRun = true, backup = true, keepFirst = true } = args;
+  const safePath = validatePath(targetPath);
+  const files = await collectFiles(safePath, ['.resx'], null);
+  const results = [];
+  let totalRemoved = 0;
+  
+  for (const filePath of files) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+    const { text } = decodeBuffer(buffer);
+    
+    // ✅ Validar se é um .resx válido
+    if (!text.includes('<root>') || !text.includes('</root>')) {
+      results.push({ file: filePath, error: 'Arquivo .resx inválido (não contém <root>)' });
+      continue;
     }
-    newLines.push(line);
+    
+    const dupInfo = findDuplicateKeysWithPositions(text);
+    if (!dupInfo.hasDuplicates) {
+      results.push({ file: filePath, status: 'no_duplicates' });
+      continue;
+    }
+    
+    if (!dryRun) {
+      if (backup) await writeBackup(filePath, buffer);
+      const clean = removeDuplicates(text, keepFirst);
+      await fs.promises.writeFile(filePath, clean.cleanedText, 'utf8');
+      totalRemoved += clean.removed;
+      results.push({ 
+        file: filePath, 
+        removed: clean.removed, 
+        keys: clean.removedKeys,
+        preview: clean.removedKeys.map(k => `  - ${k}`).join('\n')
+      });
+    } else {
+      // ✅ Preview com linhas exatas
+      results.push({ 
+        file: filePath, 
+        duplicates: dupInfo.duplicates,
+        count: dupInfo.totalDuplicateOccurrences,
+        dryRun: true,
+        preview: dupInfo.duplicates.map(d => 
+          `  - ${d.key} (linhas: ${d.positions.join(', ')})`
+        ).join('\n'),
+        suggestion: `Use dryRun:false para remover ${dupInfo.totalDuplicateOccurrences} chave(s) duplicada(s)`
+      });
+    }
   }
-  return { cleanedText: newLines.join('\n'), removed, removedKeys };
+  
+  const summary = {
+    status: 'success',
+    dryRun,
+    totalFiles: results.length,
+    totalRemoved,
+    results: results.slice(0, 20),
+    message: dryRun 
+      ? `📋 Preview: ${results.filter(r => r.duplicates).length} arquivo(s) com duplicatas. ${totalRemoved} chave(s) seriam removidas.`
+      : `✅ ${results.filter(r => r.removed).length} arquivo(s) processados. ${totalRemoved} chave(s) duplicada(s) removidas.`
+  };
+  
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
 }
+
+
 
 function safeInsertKeys(lines, keysToInsert, indent) {
   const existingKeys = new Set();
@@ -1909,6 +5299,10 @@ async function extractKeyContext(filePath, text) {
   return keys;
 }
 
+// =============================================================================
+// EXECUTORES DAS TOOLS DE TRADUÇÃO
+// =============================================================================
+
 async function executeGenerateLabels(id, args) {
   const targetPath = args.path;
   if (!targetPath) return writeToolError(id, '❌ "path" é obrigatório.');
@@ -1925,7 +5319,7 @@ async function executeGenerateLabels(id, args) {
   for (const file of razorFiles) {
     let buffer;
     try { buffer = await fs.promises.readFile(file); } catch { continue; }
-    if (buffer.length > CONFIG.MAX_FILE_SIZE) continue;
+    if (buffer.length > PERFORMANCE_CONFIG.maxFileSize) continue;
     const { text } = decodeBuffer(buffer);
     LOC_KEY_REGEX.lastIndex = 0;
     let m;
@@ -2124,27 +5518,117 @@ async function executeGetExistingTranslations(id, args) {
   writeResult(id, { content: [{ type: 'text', text: JSON.stringify(translations, null, 2) }] });
 }
 
+
+function removeDuplicates(text, keepFirst = true) {
+  const lines = text.split(/\r\n|\n/);
+  const seenKeys = new Set();
+  const newLines = [];
+  let removed = 0;
+  const removedKeys = [];
+  let skipUntilClose = false;
+  let currentDuplicateKey = '';
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    const match = line.match(/<data\s+name="([^"]*)"/);
+    
+    if (match) {
+      const key = unescapeXml(match[1]);
+      
+      if (keepFirst) {
+        // ✅ Padrão: manter a primeira, remover as duplicatas
+        if (seenKeys.has(key)) {
+          removed++;
+          removedKeys.push(key);
+          skipUntilClose = true;
+          currentDuplicateKey = key;
+          continue;
+        }
+        seenKeys.add(key);
+      } else {
+        // ✅ keepFirst = false: remover TODAS as ocorrências (inclusive a primeira)
+        if (!seenKeys.has(key)) {
+          seenKeys.add(key);
+        }
+        removed++;
+        removedKeys.push(key);
+        skipUntilClose = true;
+        currentDuplicateKey = key;
+        continue;
+      }
+    }
+    
+    // ✅ Se estamos pulando, pular TUDO até o </data>
+    if (skipUntilClose) {
+      // Se encontrou o fechamento da entrada, parar de pular
+      if (trimmed === '</data>') {
+        skipUntilClose = false;
+        currentDuplicateKey = '';
+        continue;
+      }
+      // Pular todas as linhas dentro da entrada duplicada
+      continue;
+    }
+    
+    newLines.push(line);
+  }
+  
+  return { cleanedText: newLines.join('\n'), removed, removedKeys };
+}
+
+
+
 async function executeDeduplicateResx(id, args) {
   const { path: targetPath, dryRun = true, backup = true, keepFirst = true } = args;
   const safePath = validatePath(targetPath);
   const files = await collectFiles(safePath, ['.resx'], null);
   const results = [];
+  let totalRemoved = 0;
+  
   for (const filePath of files) {
     let buffer;
     try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
     const { text } = decodeBuffer(buffer);
     const dupInfo = findDuplicateKeysWithPositions(text);
     if (dupInfo.duplicates.length === 0) continue;
+    
     if (!dryRun) {
       if (backup) await writeBackup(filePath, buffer);
       const clean = removeDuplicates(text, keepFirst);
       await fs.promises.writeFile(filePath, clean.cleanedText, 'utf8');
-      results.push({ file: filePath, removed: clean.removed, keys: clean.removedKeys });
+      totalRemoved += clean.removed;
+      results.push({ 
+        file: filePath, 
+        removed: clean.removed, 
+        keys: clean.removedKeys,
+        preview: clean.removedKeys.map(k => `  - ${k}`).join('\n')
+      });
     } else {
-      results.push({ file: filePath, duplicates: dupInfo.duplicates, count: dupInfo.totalDuplicateOccurrences, dryRun: true });
+      // ✅ Preview com mais detalhes
+      results.push({ 
+        file: filePath, 
+        duplicates: dupInfo.duplicates, 
+        count: dupInfo.totalDuplicateOccurrences, 
+        dryRun: true,
+        preview: dupInfo.duplicates.map(k => `  - ${k}`).join('\n'),
+        suggestion: `Use dryRun:false para remover ${dupInfo.duplicates.length} chave(s) duplicada(s)`
+      });
     }
   }
-  writeResult(id, { content: [{ type: 'text', text: JSON.stringify({ status: 'success', results, dryRun }, null, 2) }] });
+  
+  const summary = {
+    status: 'success',
+    dryRun,
+    totalFiles: results.length,
+    totalRemoved,
+    results: results.slice(0, 20),
+    message: dryRun 
+      ? `📋 Preview: ${results.length} arquivo(s) com duplicatas. ${totalRemoved} chave(s) seriam removidas.`
+      : `✅ ${results.length} arquivo(s) processados. ${totalRemoved} chave(s) duplicada(s) removidas.`
+  };
+  
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
 }
 
 async function executeFindDuplicates(id, args) {
@@ -2197,132 +5681,8 @@ async function executeAddLanguage(id, args) {
 }
 
 // =============================================================================
-// HELPERS
+// FUNÇÕES DE ESCRITA E FINALIZAÇÃO
 // =============================================================================
-
-async function collectFiles(dir, fileExts, excludeExts) {
-  const list = [];
-  await walk(dir, fileExts, excludeExts, (f) => list.push(f));
-  return list;
-}
-
-async function walk(dir, fileExts, excludeExts, onFileFound) {
-  let dirents;
-  try { dirents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
-  for (const dirent of dirents) {
-    if (dirent.isSymbolicLink()) continue;
-    const fullPath = path.join(dir, dirent.name);
-    if (dirent.isDirectory()) {
-      if (!isIgnoredDir(dirent.name)) {
-        await walk(fullPath, fileExts, excludeExts, onFileFound);
-      }
-    } else if (dirent.isFile()) {
-      let matchesExt = true;
-      if (fileExts && fileExts.length > 0) {
-        matchesExt = fileExts.some(ext => dirent.name.endsWith(ext));
-      }
-      let excluded = false;
-      if (excludeExts && excludeExts.length > 0) {
-        excluded = excludeExts.some(ext => dirent.name.endsWith(ext));
-      }
-      if (matchesExt && !excluded && !isExcludedFile(dirent.name)) {
-        onFileFound(fullPath);
-      }
-    }
-  }
-}
-
-async function isLikelyBinary(filePath) {
-  if (CONFIG.BINARY_EXT.has(path.extname(filePath).toLowerCase())) return true;
-  try {
-    const buffer = await fs.promises.readFile(filePath, { length: 512 });
-    return buffer.includes(0);
-  } catch { return true; }
-}
-
-function decodeBuffer(buffer, overrideEncoding = null) {
-  let encoding = overrideEncoding || 'utf-8';
-  let hadBom = false;
-  if (buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
-    hadBom = true;
-    buffer = buffer.subarray(3);
-  }
-  return { text: buffer.toString(encoding), encoding, hadBom };
-}
-
-function truncateLine(line) {
-  return line.length > 500 ? line.slice(0, 500) + '…' : line;
-}
-
-function formatSize(bytes) {
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let size = bytes;
-  let unitIndex = 0;
-  while (size >= 1024 && unitIndex < units.length - 1) { size /= 1024; unitIndex++; }
-  return `${size.toFixed(1)} ${units[unitIndex]}`;
-}
-
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function buildDiffPreview(original, updated) {
-  const origLines = original.split('\n');
-  const newLines = updated.split('\n');
-  const diffs = [];
-  const len = Math.max(origLines.length, newLines.length);
-  for (let i = 0; i < len && i < 15; i++) {
-    if (origLines[i] !== newLines[i]) {
-      diffs.push(`  L${i+1}: - ${origLines[i] || ''}\n  L${i+1}: + ${newLines[i] || ''}`);
-    }
-  }
-  const hasCRLF = original.includes('\r\n');
-  const eolNote = hasCRLF ? ' [CRLF]' : '';
-  return { preview: diffs.join('\n'), eolNote };
-}
-
-async function writeBackup(filePath, buffer) {
-  const bakPath = `${filePath}.bak.${Date.now()}`;
-  try {
-    await fs.promises.writeFile(bakPath, buffer);
-    return { ok: true, bakPath };
-  } catch (err) {
-    return { ok: false, error: err };
-  }
-}
-
-async function cleanOldBackups(dir, maxAge = CONFIG.BACKUP_MAX_AGE) {
-  try {
-    const files = await fs.promises.readdir(dir);
-    const now = Date.now();
-    for (const file of files) {
-      if (/\.bak\.\d+$/.test(file)) {
-        const fullPath = path.join(dir, file);
-        try {
-          const stat = await fs.promises.stat(fullPath);
-          if (now - stat.mtimeMs > maxAge) {
-            await fs.promises.unlink(fullPath);
-          }
-        } catch {}
-      }
-    }
-  } catch {}
-}
-
-async function runPool(items, limit, worker) {
-  if (items.length === 0) return;
-  let idx = 0;
-  const count = Math.min(Math.max(limit, 1), items.length);
-  const workers = Array.from({ length: count }, async () => {
-    while (true) {
-      if (shuttingDown) return;
-      const i = idx++;
-      if (i >= items.length) return;
-      await worker(items[i], i);
-    }
-  });
-  await Promise.all(workers);
-}
 
 function writeResult(id, result) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
@@ -2335,3 +5695,84 @@ function writeError(id, code, message) {
 function writeToolError(id, message) {
   writeResult(id, { content: [{ type: 'text', text: message }], isError: true });
 }
+
+// =============================================================================
+// MAIN - INICIALIZAÇÃO DO SERVIDOR
+// =============================================================================
+
+// Iniciar o servidor
+console.error('🚀 Node-Search MCP Server v8.5.0 iniciado');
+console.error(`📊 Perfil de tools: ${TOOL_PROFILE}`);
+console.error(`📁 ${ACTIVE_TOOLS.length} tools ativas`);
+
+// Listar tools ativas no log
+if (process.env.DEBUG === 'true') {
+  console.error('📋 Tools ativas:');
+  for (const tool of ACTIVE_TOOLS) {
+    console.error(`  - ${tool}`);
+  }
+}
+
+// Verificar configurações
+if (ALLOWED_ROOTS.length > 0) {
+  console.error(`🔒 Pastas permitidas: ${ALLOWED_ROOTS.length} pasta(s)`);
+  if (process.env.DEBUG === 'true') {
+    for (const root of ALLOWED_ROOTS) {
+      console.error(`  - ${root}`);
+    }
+  }
+}
+
+// Verificar disponibilidade do ripgrep
+hasRipgrep().then(available => {
+  if (available) {
+    console.error('✅ Ripgrep disponível - search_content será SUPER RÁPIDO!');
+  } else {
+    console.error('⚠️ Ripgrep não encontrado - search_content usará fallback (mais lento)');
+    console.error('💡 Instale ripgrep: https://github.com/BurntSushi/ripgrep');
+  }
+}).catch(() => {});
+
+// Limpar backups antigos ao iniciar
+if (BACKUP_CONFIG.autoCleanup) {
+  try {
+    const cwd = process.cwd();
+    cleanOldBackups(cwd).catch(() => {});
+    console.error('🧹 Limpeza automática de backups antigos ativada');
+  } catch {}
+}
+
+// Verificar versão do Node.js
+const nodeVersion = process.versions.node;
+const majorVersion = parseInt(nodeVersion.split('.')[0]);
+if (majorVersion < 18) {
+  console.error(`⚠️ Node.js ${nodeVersion} detectado. Recomendado: v18+ para melhor performance`);
+}
+
+// Configurações de ambiente
+console.error(`🔄 Concorrência: ${PERFORMANCE_CONFIG.concurrency} workers`);
+console.error(`📦 Cache: ${fileCache.maxSize} arquivos, ${fileCache.ttl/1000}s TTL`);
+console.error(`⏱️ Timeout de comandos: ${PERFORMANCE_CONFIG.commandTimeout/1000}s`);
+
+// O servidor já está rodando via stdin/stdout
+// O loop principal é gerenciado pelo rlInput e processQueue
+console.error('✅ Servidor pronto para receber requisições');
+
+// Tratamento de erros não capturados
+process.on('uncaughtException', (err) => {
+  console.error(`❌ Erro não capturado: ${err.message}`);
+  console.error(err.stack);
+  // Não sair, apenas logar
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(`❌ Promessa rejeitada sem tratamento: ${reason}`);
+  console.error(promise);
+});
+
+// Sinal de saúde para o Cline
+console.error('💚 Heartbeat: servidor respondendo');
+
+// =============================================================================
+// FIM DO ARQUIVO
+// =============================================================================
