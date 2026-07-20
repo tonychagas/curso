@@ -3,16 +3,18 @@
 
 /**
  * ============================================================================
- * NODE-SEARCH MCP SERVER - VERSÃO SUPER PERFORMÁTICA
+ * NODE-SEARCH MCP SERVER — VERSÃO SUPER PERFORMÁTICA + COMPACTADORES
  * ============================================================================
- * 
+ *
  * 🔥 NOVIDADES:
- * - search_content → busca conteúdo com findstr/grep (super rápido)
- * - Cache inteligente
- * - Parallel processing com pool de workers
- * - Progresso em tempo real
- * - Otimização de regex
- * 
+ * - search_content → busca conteúdo com ripgrep (super rápido)
+ * - compact_command → executa comandos e retorna saída COMPACTADA (economiza tokens)
+ * - TOOL_PROFILE → reduz o número de tools registradas (corta overhead fixo)
+ * - write_file, edit_file, create_directory, move_file → substitui o filesystem
+ * - find_symbol / get_symbol_source → navegação estrutural
+ * - Cache inteligente + validação de path + limite de tamanho
+ * - Limpeza automática de backups antigos
+ *
  * ============================================================================
  */
 
@@ -22,27 +24,270 @@ const readline = require('readline');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
+const { execFile } = require('child_process');
+const execFileAsync = promisify(execFile);
+const os = require('os');
 
 // =============================================================================
-// CONFIGURAÇÕES DE PERFORMANCE
+// PERFIL DE TOOLS (Item 5: reduz o overhead do tools/list)
+// =============================================================================
+
+const TOOL_PROFILE = process.env.TOOL_PROFILE || 'full';
+
+const TOOL_PROFILES = {
+  // Core: apenas as tools mais usadas
+  core: [
+    'find_symbol',
+    'get_symbol_source',
+    'search_content',
+    'replace_in_files',
+    'write_file',
+    'edit_file',
+    'read_lines'
+  ],
+  // Lean: core + arquivos
+  lean: [
+    'find_symbol',
+    'get_symbol_source',
+    'search_content',
+    'replace_in_files',
+    'write_file',
+    'edit_file',
+    'read_lines',
+    'find_files',
+    'get_file_info',
+    'list_directory',
+    'create_directory',
+    'move_file'
+  ],
+  // Full: todas as tools
+  full: [
+    'find_symbol',
+    'get_symbol_source',
+    'search_content',
+    'replace_in_files',
+    'write_file',
+    'edit_file',
+    'read_lines',
+    'find_files',
+    'get_file_info',
+    'list_directory',
+    'create_directory',
+    'move_file',
+    'search_files',
+    'generate_labels',
+    'insert_translations',
+    'get_translation_context',
+    'get_existing_translations',
+    'deduplicate_resx',
+    'find_duplicates',
+    'add_language',
+    'compact_command'
+  ]
+};
+
+const ACTIVE_TOOLS = TOOL_PROFILES[TOOL_PROFILE] || TOOL_PROFILES.full;
+
+// =============================================================================
+// DETECÇÃO DO RIPGREP
+// =============================================================================
+
+let ripgrepAvailable = null;
+async function hasRipgrep() {
+  if (ripgrepAvailable !== null) return ripgrepAvailable;
+  try {
+    await execFileAsync('rg', ['--version']);
+    ripgrepAvailable = true;
+  } catch {
+    ripgrepAvailable = false;
+  }
+  return ripgrepAvailable;
+}
+
+// =============================================================================
+// COMPACTADORES DE SAÍDA (Item 4)
+// =============================================================================
+
+function compactBuildOutput(output) {
+  const lines = output.split('\n');
+  const errors = [];
+  const warnings = [];
+  const errorCodes = new Set();
+  const warningCodes = new Set();
+
+  for (const line of lines) {
+    // Erros: CS0108, CS8602, etc.
+    const errorMatch = line.match(/error\s+(CS\d+)/);
+    if (errorMatch) {
+      errorCodes.add(errorMatch[1]);
+      errors.push(line.trim());
+    }
+    const warningMatch = line.match(/warning\s+(CS\d+)/);
+    if (warningMatch) {
+      warningCodes.add(warningMatch[1]);
+      warnings.push(line.trim());
+    }
+  }
+
+  // Extrair arquivos com erro
+  const errorFiles = errors.map(l => {
+    const match = l.match(/([^:]+\.cs)/);
+    return match ? match[1] : 'desconhecido';
+  });
+
+  return {
+    summary: `Build: ${errors.length} erro(s), ${warnings.length} warning(s)`,
+    errors: errors.slice(0, 10),
+    errorCount: errors.length,
+    errorCodes: [...errorCodes],
+    warningCodes: [...warningCodes],
+    errorFiles: [...new Set(errorFiles)].slice(0, 5),
+    hasErrors: errors.length > 0,
+    warningCount: warnings.length
+  };
+}
+
+function compactGitStatus(output) {
+  const lines = output.split('\n').filter(Boolean);
+  const modified = lines.filter(l => l.startsWith(' M ') || l.startsWith('M  '));
+  const added = lines.filter(l => l.startsWith(' A ') || l.startsWith('A  '));
+  const deleted = lines.filter(l => l.startsWith(' D ') || l.startsWith('D  '));
+  const untracked = lines.filter(l => l.startsWith('?? '));
+
+  return {
+    summary: `Git: ${modified.length} modificado(s), ${added.length} adicionado(s), ${deleted.length} deletado(s), ${untracked.length} não rastreado(s)`,
+    modified: modified.map(l => l.replace(/^.{3}/, '').trim()),
+    added: added.map(l => l.replace(/^.{3}/, '').trim()),
+    deleted: deleted.map(l => l.replace(/^.{3}/, '').trim()),
+    untracked: untracked.map(l => l.replace(/^.{3}/, '').trim()),
+    hasChanges: modified.length > 0 || added.length > 0 || deleted.length > 0
+  };
+}
+
+function compactGitDiff(output) {
+  const lines = output.split('\n');
+  const files = [];
+  let currentFile = null;
+  let additions = 0;
+  let deletions = 0;
+
+  for (const line of lines) {
+    const fileMatch = line.match(/^diff --git a\/(.+?) b\//);
+    if (fileMatch) {
+      if (currentFile) {
+        files.push({ file: currentFile, additions, deletions });
+      }
+      currentFile = fileMatch[1];
+      additions = 0;
+      deletions = 0;
+      continue;
+    }
+    if (line.startsWith('+') && !line.startsWith('+++')) additions++;
+    if (line.startsWith('-') && !line.startsWith('---')) deletions++;
+  }
+  if (currentFile) {
+    files.push({ file: currentFile, additions, deletions });
+  }
+
+  const totalAdd = files.reduce((s, f) => s + f.additions, 0);
+  const totalDel = files.reduce((s, f) => s + f.deletions, 0);
+
+  return {
+    summary: `${files.length} arquivo(s) alterados, +${totalAdd}/-${totalDel}`,
+    files: files.slice(0, 10),
+    totalFiles: files.length,
+    totalAdditions: totalAdd,
+    totalDeletions: totalDel
+  };
+}
+
+function compactGenericOutput(output, command) {
+  const lines = output.split('\n').filter(Boolean);
+  const firstLines = lines.slice(0, 5);
+  const lastLines = lines.slice(-5);
+  const totalLines = lines.length;
+
+  return {
+    summary: `Comando executado: ${command} — ${totalLines} linha(s) de saída`,
+    preview: firstLines,
+    tail: lastLines,
+    totalLines: totalLines,
+    hasOutput: totalLines > 0
+  };
+}
+
+function compactOutput(command, stdout, stderr) {
+  const fullOutput = stdout + '\n' + stderr;
+
+  // Detectar tipo de comando
+  if (command.includes('dotnet build') || command.includes('dotnet test')) {
+    return compactBuildOutput(fullOutput);
+  }
+  if (command.includes('git status')) {
+    return compactGitStatus(stdout);
+  }
+  if (command.includes('git diff')) {
+    return compactGitDiff(stdout);
+  }
+  // Fallback: resumo genérico
+  return compactGenericOutput(fullOutput, command);
+}
+
+// =============================================================================
+// CONFIGURAÇÕES DE PERFORMANCE E SEGURANÇA
 // =============================================================================
 
 const CONFIG = {
-  MAX_FILE_SIZE: 15 * 1024 * 1024,     // 15MB
-  MAX_RESULTS: 2000,                   // Máximo de resultados
-  MAX_FILES: 1000,                     // Máximo de arquivos por operação
-  CONCURRENCY: 16,                     // Arquivos processados em paralelo
-  CACHE_TTL: 60000,                    // 1 minuto de cache
+  MAX_FILE_SIZE: 15 * 1024 * 1024,
+  MAX_WRITE_SIZE: 10 * 1024 * 1024,
+  MAX_RESULTS: 2000,
+  MAX_FILES: 1000,
+  MAX_READ_LINES: 1000,
+  CONCURRENCY: Math.min(os.cpus().length * 2, 32),
+  CACHE_TTL: 60000,
+  DIR_CACHE_TTL: 5000,
+  BACKUP_MAX_AGE: 7 * 24 * 60 * 60 * 1000,
   BINARY_EXT: new Set([
     '.dll', '.exe', '.pdb', '.png', '.jpg', '.jpeg', '.gif', '.ico',
     '.zip', '.pfx', '.bmp', '.webp', '.woff', '.woff2', '.ttf', '.eot',
     '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
-  ]),
-  IGNORE_DIRS: new Set([
-    'bin', 'obj', '.git', 'node_modules', 'dist', '.vs', '.idea',
-    'TestResults', 'packages', '__pycache__', '.venv', 'venv', 'env', '.env'
   ])
 };
+
+// =============================================================================
+// CONFIG EXTERNA (.mcp-config.json)
+// =============================================================================
+
+function loadMcpConfig() {
+  const configPath = path.join(__dirname, '.mcp-config.json');
+  try {
+    const raw = fs.readFileSync(configPath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+const MCP_CONFIG = loadMcpConfig();
+const ALLOWED_ROOTS = (MCP_CONFIG.allowedRoots || []).map(p => path.resolve(p));
+const EXTRA_IGNORE_DIRS = new Set((MCP_CONFIG.excludeDirs || []).map(d => d.toLowerCase()));
+
+function wildcardToRegex(pattern) {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+const EXCLUDE_FILE_PATTERNS = (MCP_CONFIG.excludeFilePatterns || []).map(wildcardToRegex);
+
+const IGNORE_DIRS_LOWER = new Set([...['bin', 'obj', '.git', 'node_modules', 'dist', '.vs', '.idea', 'TestResults', 'packages', '__pycache__', '.venv', 'venv', 'env', '.env']].map(d => d.toLowerCase()));
+
+function isIgnoredDir(name) {
+  const lower = name.toLowerCase();
+  return IGNORE_DIRS_LOWER.has(lower) || EXTRA_IGNORE_DIRS.has(lower);
+}
+
+function isExcludedFile(name) {
+  return EXCLUDE_FILE_PATTERNS.some(re => re.test(name));
+}
 
 // =============================================================================
 // CACHE INTELIGENTE
@@ -88,11 +333,58 @@ class SmartCache {
   }
 }
 
+class DirCache {
+  constructor(ttl = CONFIG.DIR_CACHE_TTL) {
+    this.cache = new Map();
+    this.ttl = ttl;
+  }
+
+  get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > this.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+    return entry.data;
+  }
+
+  set(key, data) {
+    this.cache.set(key, { data, timestamp: Date.now() });
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+}
+
 const fileCache = new SmartCache(200, 30000);
 const searchCache = new SmartCache(50, 10000);
+const dirCache = new DirCache();
 
 // =============================================================================
-// JSON-RPC SERVER (OTIMIZADO)
+// LOGGER E SEGURANÇA
+// =============================================================================
+
+function logOperation(operation, filePath, user = 'cline') {
+  const timestamp = new Date().toISOString();
+  console.error(`[${timestamp}] ${user} ${operation} ${filePath}`);
+}
+
+function validatePath(inputPath, baseDir = process.cwd()) {
+  const resolved = path.resolve(baseDir, inputPath);
+  const normalized = path.normalize(resolved);
+  if (ALLOWED_ROOTS.length > 0) {
+    const allowed = ALLOWED_ROOTS.some(root => normalized === root || normalized.startsWith(root + path.sep));
+    if (!allowed) {
+      throw new Error(`Caminho fora das pastas permitidas em .mcp-config.json (allowedRoots): ${normalized}`);
+    }
+  }
+  return normalized;
+}
+
+// =============================================================================
+// JSON-RPC SERVER
 // =============================================================================
 
 const rlInput = readline.createInterface({ input: process.stdin });
@@ -163,7 +455,7 @@ async function handleLine(raw) {
     writeResult(id, {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'node-search', version: '6.0.0' }
+      serverInfo: { name: 'node-search', version: '7.0.0' }
     });
     return;
   }
@@ -187,6 +479,13 @@ async function handleLine(raw) {
         case 'find_files': await executeFindFiles(id, toolArgs); break;
         case 'get_file_info': await executeGetFileInfo(id, toolArgs); break;
         case 'list_directory': await executeListDirectory(id, toolArgs); break;
+        case 'write_file': await executeWriteFile(id, toolArgs); break;
+        case 'edit_file': await executeEditFile(id, toolArgs); break;
+        case 'create_directory': await executeCreateDirectory(id, toolArgs); break;
+        case 'move_file': await executeMoveFile(id, toolArgs); break;
+        case 'find_symbol': await executeFindSymbol(id, toolArgs); break;
+        case 'get_symbol_source': await executeGetSymbolSource(id, toolArgs); break;
+        case 'compact_command': await executeCompactCommand(id, toolArgs); break;
         case 'generate_labels': await executeGenerateLabels(id, toolArgs); break;
         case 'insert_translations': await executeInsertTranslations(id, toolArgs); break;
         case 'get_translation_context': await executeGetTranslationContext(id, toolArgs); break;
@@ -194,7 +493,6 @@ async function handleLine(raw) {
         case 'deduplicate_resx': await executeDeduplicateResx(id, toolArgs); break;
         case 'find_duplicates': await executeFindDuplicates(id, toolArgs); break;
         case 'add_language': await executeAddLanguage(id, toolArgs); break;
-        case 'find_symbol': await executeFindSymbol(id, toolArgs); break;
         default: writeToolError(id, `Tool not found: ${toolName}`);
       }
     } catch (err) {
@@ -209,230 +507,313 @@ async function handleLine(raw) {
 }
 
 // =============================================================================
-// TOOL DEFINITIONS
+// TOOL DEFINITIONS (apenas as tools ativas no perfil)
 // =============================================================================
 
-function getToolDefinitions() {
-  return [
-    {
-      name: 'search_content',
-      description: '🔍 Busca conteúdo em arquivos usando findstr/grep (SUPER RÁPIDO!). Suporta regex, múltiplos padrões e busca em paralelo.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Texto ou regex para buscar' },
-          path: { type: 'string', description: 'Diretório ou arquivo para buscar' },
-          filePattern: { type: 'string', description: 'Extensões separadas por vírgula (ex: .cs,.razor). Default: todos' },
-          excludePattern: { type: 'string', description: 'Extensões para excluir (ex: .min.js)' },
-          simpleMatch: { type: 'boolean', description: 'Busca literal (não regex). Default: false' },
-          caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
-          context: { type: 'number', description: 'Linhas de contexto (0-5). Default: 0' },
-          maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' },
-          useFindstr: { type: 'boolean', description: 'Usar findstr (Windows) em vez de leitura manual. Default: true' }
-        },
-        required: ['pattern', 'path']
-      }
-    },
-    {
-      name: 'search_files',
-      description: 'Busca padrões em arquivos com auto-detecção de encoding. Suporta múltiplos padrões com "||"',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Padrão (regex ou literal). Use "||" para múltiplos' },
-          path: { type: 'string', description: 'Arquivo ou diretório' },
-          filePattern: { type: 'string', description: 'Extensões separadas por vírgula' },
-          excludePattern: { type: 'string', description: 'Extensões para excluir' },
-          simpleMatch: { type: 'boolean', description: 'Busca literal. Default: false' },
-          context: { type: 'number', description: 'Linhas de contexto (0-5). Default: 0' },
-          caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
-          maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' }
-        },
-        required: ['pattern', 'path']
-      }
-    },
-    {
-      name: 'replace_in_files',
-      description: 'Busca e substitui texto/regex em arquivos. Por padrão dryRun (preview).',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Texto ou regex a buscar' },
-          replacement: { type: 'string', description: 'Texto de substituição' },
-          path: { type: 'string', description: 'Arquivo ou diretório' },
-          filePattern: { type: 'string', description: 'Extensões separadas por vírgula' },
-          excludePattern: { type: 'string', description: 'Extensões para excluir' },
-          simpleMatch: { type: 'boolean', description: 'Busca literal. Default: false' },
-          caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
-          dryRun: { type: 'boolean', description: 'Preview sem alterar. Default: true' },
-          maxFiles: { type: 'number', description: 'Máximo de arquivos. Default: 200, máx 1000' },
-          backup: { type: 'boolean', description: 'Criar .bak. Default: true' }
-        },
-        required: ['pattern', 'replacement', 'path']
-      }
-    },
-    {
-      name: 'read_lines',
-      description: 'Lê intervalo de linhas de um arquivo (streaming)',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Caminho do arquivo' },
-          startLine: { type: 'number', description: 'Primeira linha (1-indexed). Default: 1' },
-          endLine: { type: 'number', description: 'Última linha. Default: startLine + 49' }
-        },
-        required: ['path']
-      }
-    },
-    {
-      name: 'find_files',
-      description: 'Busca arquivos por nome (suporta wildcards)',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Nome ou padrão (ex: *.cs, Program.cs)' },
-          path: { type: 'string', description: 'Diretório (default: .)' },
-          maxResults: { type: 'number', description: 'Máximo de resultados. Default: 100' },
-          caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' }
-        },
-        required: ['pattern']
-      }
-    },
-    {
-      name: 'get_file_info',
-      description: 'Obtém informações detalhadas de um arquivo',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Caminho do arquivo' },
-          includeContent: { type: 'boolean', description: 'Incluir preview. Default: false' }
-        },
-        required: ['path']
-      }
-    },
-    {
-      name: 'list_directory',
-      description: 'Lista diretório com estrutura visual (árvore)',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Diretório (default: .)' },
-          recursive: { type: 'boolean', description: 'Listar recursivamente. Default: false' },
-          maxDepth: { type: 'number', description: 'Profundidade máxima. Default: 3, máx 10' }
-        }
-      }
-    },
-    {
-      name: 'generate_labels',
-      description: 'Escaneia .razor em busca de Loc["Chave"] e gera relatório de traduções',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Diretório dos .razor' },
-          dryRun: { type: 'boolean', description: 'Apenas relatório. Default: true' },
-          resxPath: { type: 'string', description: 'Pasta dos .resx (opcional)' }
-        },
-        required: ['path']
-      }
-    },
-    {
-      name: 'insert_translations',
-      description: 'Insere traduções nos .resx (suporta 1000+ chaves)',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Diretório dos .resx' },
-          translations: { type: 'object', description: 'Traduções: { "pt-BR": { "Key": "Valor" } }' },
-          dryRun: { type: 'boolean', description: 'Preview. Default: true' },
-          backup: { type: 'boolean', description: 'Criar backup. Default: true' }
-        },
-        required: ['path', 'translations']
-      }
-    },
-    {
-      name: 'get_translation_context',
-      description: 'Mostra onde cada chave Loc["Chave"] é usada',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Diretório dos .razor' },
-          keys: { type: 'array', description: 'Chaves específicas (opcional)', items: { type: 'string' } }
-        },
-        required: ['path']
-      }
-    },
-    {
-      name: 'get_existing_translations',
-      description: 'Mostra traduções já existentes nos .resx',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Diretório dos .resx' },
-          language: { type: 'string', description: 'Idioma específico (opcional)' },
-          keys: { type: 'array', description: 'Chaves específicas (opcional)', items: { type: 'string' } }
-        },
-        required: ['path']
-      }
-    },
-    {
-      name: 'deduplicate_resx',
-      description: 'Remove chaves duplicadas em .resx',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Arquivo .resx ou diretório' },
-          dryRun: { type: 'boolean', description: 'Preview. Default: true' },
-          backup: { type: 'boolean', description: 'Criar backup. Default: true' },
-          keepFirst: { type: 'boolean', description: 'Manter primeira ocorrência. Default: true' }
-        },
-        required: ['path']
-      }
-    },
-    {
-      name: 'find_duplicates',
-      description: 'Encontra duplicatas em .resx (rápido)',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Diretório dos .resx' },
-          filePattern: { type: 'string', description: 'Filtrar arquivos (opcional)' }
-        },
-        required: ['path']
-      }
-    },
-    {
-      name: 'add_language',
-      description: 'Adiciona suporte a novo idioma',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Diretório dos .resx' },
-          language: { type: 'string', description: 'Código do idioma (ex: fr-FR)' },
-          sourceLanguage: { type: 'string', description: 'Idioma fonte (default: pt-BR)' },
-          dryRun: { type: 'boolean', description: 'Preview. Default: true' }
-        },
-        required: ['path', 'language']
-      }
-    },
-    {
-      name: 'find_symbol',
-      description: '💰 Acha DECLARAÇÃO de classe/método/propriedade em .cs/.razor (não usos). Retorna só arquivo:linha, sem contexto — muito mais barato em tokens que search_content pra localizar onde algo é definido.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Nome exato do símbolo (ex: NfeService, EmitirNota)' },
-          path: { type: 'string', description: 'Diretório para buscar (default: .)' },
-          kind: { type: 'string', enum: ['class', 'method', 'property', 'any'], description: 'Tipo de símbolo. Default: any' },
-          maxResults: { type: 'number', description: 'Máximo de resultados. Default: 100' }
-        },
-        required: ['name']
+const ALL_TOOL_DEFINITIONS = {
+  find_symbol: {
+    name: 'find_symbol',
+    description: '💰 Busca DECLARAÇÃO de classe/método/propriedade em .cs/.razor.cs (não usos). ⚡ SEMPRE use esta tool ANTES de search_content para localizar onde algo é definido.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nome exato do símbolo' },
+        path: { type: 'string', description: 'Diretório para buscar (default: .)' },
+        kind: { type: 'string', enum: ['class', 'method', 'property', 'constructor', 'field', 'enum', 'any'], description: 'Tipo de símbolo. Default: any' },
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 100' }
+      },
+      required: ['name']
+    }
+  },
+  get_symbol_source: {
+    name: 'get_symbol_source',
+    description: '📖 Retorna o corpo COMPLETO de um símbolo (método, classe, propriedade) em UMA chamada. ⚡ Use DEPOIS de find_symbol.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Nome exato do símbolo' },
+        path: { type: 'string', description: 'Arquivo específico (opcional)' },
+        kind: { type: 'string', enum: ['class', 'method', 'property', 'constructor', 'field', 'enum', 'any'], description: 'Tipo de símbolo. Default: any' }
+      },
+      required: ['name']
+    }
+  },
+  search_content: {
+    name: 'search_content',
+    description: '🔍 Busca conteúdo em arquivos usando ripgrep (SUPER RÁPIDO!). ⚠️ Use APENAS quando você NÃO sabe o nome exato do símbolo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Texto ou regex para buscar' },
+        path: { type: 'string', description: 'Diretório ou arquivo para buscar' },
+        filePattern: { type: 'string', description: 'Extensões separadas por vírgula' },
+        excludePattern: { type: 'string', description: 'Extensões para excluir' },
+        simpleMatch: { type: 'boolean', description: 'Busca literal (não regex). Default: false' },
+        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
+        context: { type: 'number', description: 'Linhas de contexto (0-5). Default: 0' },
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' }
+      },
+      required: ['pattern', 'path']
+    }
+  },
+  replace_in_files: {
+    name: 'replace_in_files',
+    description: 'Busca e substitui texto/regex em arquivos. Por padrão dryRun (preview).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Texto ou regex a buscar' },
+        replacement: { type: 'string', description: 'Texto de substituição' },
+        path: { type: 'string', description: 'Arquivo ou diretório' },
+        filePattern: { type: 'string', description: 'Extensões separadas por vírgula' },
+        excludePattern: { type: 'string', description: 'Extensões para excluir' },
+        simpleMatch: { type: 'boolean', description: 'Busca literal. Default: false' },
+        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
+        dryRun: { type: 'boolean', description: 'Preview sem alterar. Default: true' },
+        maxFiles: { type: 'number', description: 'Máximo de arquivos. Default: 200, máx 1000' },
+        backup: { type: 'boolean', description: 'Criar .bak. Default: true' }
+      },
+      required: ['pattern', 'replacement', 'path']
+    }
+  },
+  read_lines: {
+    name: 'read_lines',
+    description: 'Lê intervalo de linhas de um arquivo (streaming) — máximo 1000 linhas.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do arquivo' },
+        startLine: { type: 'number', description: 'Primeira linha (1-indexed). Default: 1' },
+        endLine: { type: 'number', description: 'Última linha. Default: startLine + 49. Máx 1000.' }
+      },
+      required: ['path']
+    }
+  },
+  find_files: {
+    name: 'find_files',
+    description: 'Busca arquivos por nome (suporta wildcards)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Nome ou padrão (ex: *.cs, Program.cs)' },
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 100' },
+        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' }
+      },
+      required: ['pattern']
+    }
+  },
+  get_file_info: {
+    name: 'get_file_info',
+    description: 'Obtém informações detalhadas de um arquivo',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do arquivo' },
+        includeContent: { type: 'boolean', description: 'Incluir preview. Default: false' }
+      },
+      required: ['path']
+    }
+  },
+  list_directory: {
+    name: 'list_directory',
+    description: 'Lista diretório com estrutura visual (árvore) — cache de 5s para repetições.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório (default: .)' },
+        recursive: { type: 'boolean', description: 'Listar recursivamente. Default: false' },
+        maxDepth: { type: 'number', description: 'Profundidade máxima. Default: 3, máx 10' }
       }
     }
-  ];
+  },
+  write_file: {
+    name: 'write_file',
+    description: '📝 Cria ou sobrescreve um arquivo com o conteúdo especificado. Máx 10MB.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do arquivo' },
+        content: { type: 'string', description: 'Conteúdo a escrever' },
+        encoding: { type: 'string', description: 'Encoding (default: utf-8)' },
+        createDirs: { type: 'boolean', description: 'Criar diretórios se não existirem (default: true)' },
+        overwrite: { type: 'boolean', description: 'Sobrescrever se existir (default: true)' },
+        backup: { type: 'boolean', description: 'Fazer backup antes de sobrescrever (default: true)' }
+      },
+      required: ['path', 'content']
+    }
+  },
+  edit_file: {
+    name: 'edit_file',
+    description: '✏️ Edita um arquivo com preview de diff antes de aplicar. Backup automático.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do arquivo' },
+        content: { type: 'string', description: 'Novo conteúdo' },
+        dryRun: { type: 'boolean', description: 'Apenas preview (default: true)' },
+        backup: { type: 'boolean', description: 'Criar backup (default: true)' }
+      },
+      required: ['path', 'content']
+    }
+  },
+  create_directory: {
+    name: 'create_directory',
+    description: '📁 Cria um diretório (e subdiretórios se necessário).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do diretório' },
+        recursive: { type: 'boolean', description: 'Criar recursivamente (default: true)' }
+      },
+      required: ['path']
+    }
+  },
+  move_file: {
+    name: 'move_file',
+    description: '📦 Move ou renomeia um arquivo com segurança (backup e overwrite controlado).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: { type: 'string', description: 'Caminho do arquivo de origem' },
+        destination: { type: 'string', description: 'Caminho de destino' },
+        overwrite: { type: 'boolean', description: 'Sobrescrever se existir (default: true)' },
+        backup: { type: 'boolean', description: 'Criar backup do destino (default: true)' }
+      },
+      required: ['source', 'destination']
+    }
+  },
+  compact_command: {
+    name: 'compact_command',
+    description: '⚡ Executa um comando e retorna a saída COMPACTADA (resumida). Economiza ~90% de tokens em comandos longos como dotnet build, git diff, git status. Use SEMPRE para comandos que produzem saída longa.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'Comando a executar (ex: dotnet build, git diff, git status)' },
+        args: { type: 'string', description: 'Argumentos do comando (opcional)' },
+        cwd: { type: 'string', description: 'Diretório de trabalho (default: .)' }
+      },
+      required: ['command']
+    }
+  },
+  search_files: {
+    name: 'search_files',
+    description: 'Busca padrões em arquivos com auto-detecção de encoding. Suporta múltiplos padrões com "||"',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Padrão (regex ou literal). Use "||" para múltiplos' },
+        path: { type: 'string', description: 'Arquivo ou diretório' },
+        filePattern: { type: 'string', description: 'Extensões separadas por vírgula' },
+        excludePattern: { type: 'string', description: 'Extensões para excluir' },
+        simpleMatch: { type: 'boolean', description: 'Busca literal. Default: false' },
+        context: { type: 'number', description: 'Linhas de contexto (0-5). Default: 0' },
+        caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' }
+      },
+      required: ['pattern', 'path']
+    }
+  },
+  generate_labels: {
+    name: 'generate_labels',
+    description: 'Escaneia .razor em busca de Loc["Chave"] e gera relatório de traduções',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .razor' },
+        dryRun: { type: 'boolean', description: 'Apenas relatório. Default: true' },
+        resxPath: { type: 'string', description: 'Pasta dos .resx (opcional)' }
+      },
+      required: ['path']
+    }
+  },
+  insert_translations: {
+    name: 'insert_translations',
+    description: 'Insere traduções nos .resx (suporta 1000+ chaves)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        translations: { type: 'object', description: 'Traduções: { "pt-BR": { "Key": "Valor" } }' },
+        dryRun: { type: 'boolean', description: 'Preview. Default: true' },
+        backup: { type: 'boolean', description: 'Criar backup. Default: true' }
+      },
+      required: ['path', 'translations']
+    }
+  },
+  get_translation_context: {
+    name: 'get_translation_context',
+    description: 'Mostra onde cada chave Loc["Chave"] é usada',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .razor' },
+        keys: { type: 'array', description: 'Chaves específicas (opcional)', items: { type: 'string' } }
+      },
+      required: ['path']
+    }
+  },
+  get_existing_translations: {
+    name: 'get_existing_translations',
+    description: 'Mostra traduções já existentes nos .resx',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        language: { type: 'string', description: 'Idioma específico (opcional)' },
+        keys: { type: 'array', description: 'Chaves específicas (opcional)', items: { type: 'string' } }
+      },
+      required: ['path']
+    }
+  },
+  deduplicate_resx: {
+    name: 'deduplicate_resx',
+    description: 'Remove chaves duplicadas em .resx',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Arquivo .resx ou diretório' },
+        dryRun: { type: 'boolean', description: 'Preview. Default: true' },
+        backup: { type: 'boolean', description: 'Criar backup. Default: true' },
+        keepFirst: { type: 'boolean', description: 'Manter primeira ocorrência. Default: true' }
+      },
+      required: ['path']
+    }
+  },
+  find_duplicates: {
+    name: 'find_duplicates',
+    description: 'Encontra duplicatas em .resx (rápido)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        filePattern: { type: 'string', description: 'Filtrar arquivos (opcional)' }
+      },
+      required: ['path']
+    }
+  },
+  add_language: {
+    name: 'add_language',
+    description: 'Adiciona suporte a novo idioma',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        language: { type: 'string', description: 'Código do idioma (ex: fr-FR)' },
+        sourceLanguage: { type: 'string', description: 'Idioma fonte (default: pt-BR)' },
+        dryRun: { type: 'boolean', description: 'Preview. Default: true' }
+      },
+      required: ['path', 'language']
+    }
+  }
+};
+
+function getToolDefinitions() {
+  return ACTIVE_TOOLS.map(name => ALL_TOOL_DEFINITIONS[name]).filter(Boolean);
 }
 
 // =============================================================================
-// 🔥 NOVA FUNÇÃO: search_content (USANDO FINDSTR/ GREP)
+// FUNÇÃO: search_content (COM RIPGREP)
 // =============================================================================
 
 async function executeSearchContent(id, args) {
@@ -444,32 +825,26 @@ async function executeSearchContent(id, args) {
   const caseSensitive = args.caseSensitive || false;
   const context = Math.min(args.context || 0, 5);
   const maxResults = Math.min(args.maxResults || 500, CONFIG.MAX_RESULTS);
-  const useFindstr = args.useFindstr !== false;
 
   if (!pattern) {
     return writeToolError(id, '❌ Parâmetro "pattern" é obrigatório.');
   }
 
-  // Verificar se é Windows ou Linux
-  const isWindows = process.platform === 'win32';
-
   try {
     const stat = await fs.promises.stat(searchPath);
     if (!stat.isDirectory()) {
-      // Buscar em um único arquivo
       return executeSearchInFile(id, searchPath, pattern, simpleMatch, caseSensitive, context);
     }
   } catch {
     return writeToolError(id, `❌ Caminho não encontrado: ${searchPath}`);
   }
 
-  // Se for Windows e usar findstr, executar via terminal
-  if (isWindows && useFindstr) {
-    return executeFindstrSearch(id, searchPath, pattern, fileExts, excludeExts, simpleMatch, caseSensitive, context, maxResults);
+  if (await hasRipgrep()) {
+    return executeRipgrepSearch(id, searchPath, pattern, fileExts, excludeExts, simpleMatch, caseSensitive, context, maxResults);
   }
 
-  // Busca manual (fallback) - paralelizada
-  const files = await collectFiles(searchPath, fileExts, excludeExts);
+  const safePath = validatePath(searchPath);
+  const files = await collectFiles(safePath, fileExts, excludeExts);
   if (files.length === 0) {
     return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhum arquivo encontrado em ${searchPath}` }] });
   }
@@ -546,93 +921,122 @@ async function executeSearchContent(id, args) {
 }
 
 // =============================================================================
-// 🔥 BUSCA COM FINDSTR (WINDOWS - SUPER RÁPIDO)
+// RIPGREP SEARCH (COM AGRUPAMENTO)
 // =============================================================================
 
-async function executeFindstrSearch(id, searchPath, pattern, fileExts, excludeExts, simpleMatch, caseSensitive, context, maxResults) {
-  const cwd = process.cwd();
-  const relPath = path.relative(cwd, searchPath) || '.';
-
-  // Montar extensões para findstr
-  let extFilter = '';
-  if (fileExts && fileExts.length > 0) {
-    const extPattern = fileExts.map(ext => `*${ext}`).join(' ');
-    extFilter = `${extPattern}`;
-  } else {
-    extFilter = '*.*';
-  }
-
-  // Montar comando findstr
-  let findstrArgs = '/s /n';
-  if (!caseSensitive) findstrArgs += ' /i';
-  if (simpleMatch) findstrArgs += ' /c:';
-  else findstrArgs += ' /r /c:';
-
-  // Escapar padrão para o findstr
-  let escapedPattern = pattern;
-  if (!simpleMatch) {
-    // findstr usa regex básico, converter caracteres especiais
-    escapedPattern = pattern.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  }
-
-  const cmd = `findstr ${findstrArgs}"${escapedPattern}" "${relPath}\\${extFilter}"`;
+async function executeRipgrepSearch(id, searchPath, pattern, fileExts, excludeExts, simpleMatch, caseSensitive, context, maxResults) {
+  const rgArgs = ['--line-number', '--no-heading', '--color=never'];
+  if (!caseSensitive) rgArgs.push('-i');
+  if (simpleMatch) rgArgs.push('-F');
+  if (context > 0) rgArgs.push('-C', String(context));
+  if (fileExts) for (const ext of fileExts) rgArgs.push('-g', `*${ext}`);
+  if (excludeExts) for (const ext of excludeExts) rgArgs.push('-g', `!*${ext}`);
+  for (const dir of IGNORE_DIRS_LOWER) rgArgs.push('-g', `!${dir}/**`);
+  for (const dir of EXTRA_IGNORE_DIRS) rgArgs.push('-g', `!${dir}/**`);
+  rgArgs.push('-m', String(maxResults), '--', pattern, searchPath);
 
   try {
-    const { stdout, stderr } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
-    
-    if (stderr && !stderr.includes('File not found')) {
-      return writeToolError(id, `❌ Erro findstr: ${stderr}`);
-    }
-
+    const { stdout } = await execFileAsync('rg', rgArgs, { maxBuffer: 20 * 1024 * 1024 });
     const lines = stdout.split('\n').filter(Boolean);
-    if (lines.length === 0) {
-      return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma ocorrência de "${pattern}" encontrada.` }] });
+
+    const grouped = new Map();
+    for (const line of lines) {
+      const firstColon = line.indexOf(':');
+      if (firstColon === -1) continue;
+      const file = line.substring(0, firstColon);
+      const rest = line.substring(firstColon + 1);
+      if (!grouped.has(file)) grouped.set(file, []);
+      grouped.get(file).push(rest);
     }
 
-    // Limitar resultados
-    const truncated = lines.length > maxResults;
-    const output = lines.slice(0, maxResults);
+    const output = [];
+    let total = 0;
+    for (const [file, matches] of grouped) {
+      total += matches.length;
+      const preview = matches.slice(0, 3).map(m => `  ${m}`).join('\n');
+      const more = matches.length > 3 ? `\n  ... +${matches.length - 3} mais` : '';
+      output.push(`📄 ${file} (${matches.length} ocorrência(s)):\n${preview}${more}`);
+    }
 
-    const note = truncated ? `\n\n_(Truncado em ${maxResults} de ${lines.length} resultados. Use filtro mais específico.)_` : '';
+    const truncated = lines.length > maxResults;
+    const note = truncated ? `\n\n_(Truncado em ${maxResults} de ${total} resultados. Use filtro mais específico.)_` : '';
 
     writeResult(id, {
       content: [{
         type: 'text',
-        text: `🔍 Encontradas ${lines.length} ocorrência(s) de "${pattern}"\n\n${output.join('\n')}${note}`
+        text: `🔍⚡ Encontradas ${total} ocorrência(s) de "${pattern}" (ripgrep)\n\n${output.join('\n\n')}${note}`
       }]
     });
   } catch (err) {
     if (err.code === 1) {
-      // findstr retorna 1 quando não encontra nada
       return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma ocorrência de "${pattern}" encontrada.` }] });
     }
-    return writeToolError(id, `❌ Erro ao executar findstr: ${err.message}`);
+    return writeToolError(id, `❌ Erro ao executar ripgrep: ${err.message}`);
   }
 }
 
 // =============================================================================
-// TOOL: search_files (MELHORADO COM CACHE)
+// TOOL: search_files (alias)
 // =============================================================================
 
 async function executeSearchFiles(id, args) {
-  const searchPath = args.path || '.';
-  const patternStr = args.pattern;
-  const fileExts = args.filePattern ? args.filePattern.split(',').map(e => e.trim()).filter(Boolean) : null;
-  const excludeExts = args.excludePattern ? args.excludePattern.split(',').map(e => e.trim()).filter(Boolean) : null;
-  const simpleMatch = args.simpleMatch || false;
-  const contextLines = Math.min(args.context || 0, 5);
-  const caseSensitive = args.caseSensitive || false;
-  const maxResults = Math.min(args.maxResults || 500, CONFIG.MAX_RESULTS);
-
-  // search_files é um alias de search_content (mesma engine, mesmo formato de saída).
-  // Delega direto, com o MESMO id, e aguarda terminar — sem isso a chamada nunca respondia.
   const argsCopy = { ...args };
-  if (argsCopy.useFindstr === undefined) argsCopy.useFindstr = process.platform === 'win32';
   await executeSearchContent(id, argsCopy);
 }
 
 // =============================================================================
-// TOOL: replace_in_files (OTIMIZADO)
+// TOOL: compact_command (compacta saída de comandos — Item 4)
+// =============================================================================
+
+async function executeCompactCommand(id, args) {
+  const command = args.command;
+  const cmdArgs = args.args || '';
+  const cwd = args.cwd || process.cwd();
+
+  if (!command) {
+    return writeToolError(id, '❌ "command" é obrigatório.');
+  }
+
+  const fullCommand = `${command} ${cmdArgs}`.trim();
+
+  try {
+    logOperation('compact_command', fullCommand);
+    const { stdout, stderr } = await execAsync(fullCommand, { cwd, maxBuffer: 10 * 1024 * 1024 });
+    const compacted = compactOutput(command, stdout, stderr);
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'success',
+          command: fullCommand,
+          cwd: cwd,
+          ...compacted
+        }, null, 2)
+      }]
+    });
+  } catch (err) {
+    // Mesmo com erro, tentar compactar a saída
+    const output = err.stdout || err.stderr || err.message || '';
+    const compacted = compactOutput(command, output, '');
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'error',
+          command: fullCommand,
+          cwd: cwd,
+          exitCode: err.code || 1,
+          ...compacted
+        }, null, 2)
+      }]
+    });
+  }
+}
+
+// =============================================================================
+// TOOL: replace_in_files
 // =============================================================================
 
 async function executeReplaceInFiles(id, args) {
@@ -659,7 +1063,8 @@ async function executeReplaceInFiles(id, args) {
     return writeToolError(id, `❌ Regex inválida: ${err.message}`);
   }
 
-  const fileList = await collectFiles(searchPath, fileExts, excludeExts);
+  const safePath = validatePath(searchPath);
+  const fileList = await collectFiles(safePath, fileExts, excludeExts);
   if (fileList.length === 0) {
     return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhum arquivo encontrado em ${searchPath}` }], isError: true });
   }
@@ -704,7 +1109,6 @@ async function executeReplaceInFiles(id, args) {
     });
   }
 
-  // Executar substituição
   const results = [];
   await runPool(changes, CONFIG.CONCURRENCY, async (change) => {
     if (shuttingDown) { results.push(`${change.filePath}: SKIPPED`); return; }
@@ -734,7 +1138,7 @@ async function executeReplaceInFiles(id, args) {
 }
 
 // =============================================================================
-// TOOL: read_lines (STREAMING)
+// TOOL: read_lines
 // =============================================================================
 
 async function executeReadLines(id, args) {
@@ -742,7 +1146,11 @@ async function executeReadLines(id, args) {
   if (!filePath) return writeToolError(id, '❌ "path" é obrigatório.');
 
   const startLine = Math.max(1, args.startLine || 1);
-  const endLine = args.endLine || (startLine + 49);
+  let endLine = args.endLine || (startLine + 49);
+
+  if (endLine - startLine > CONFIG.MAX_READ_LINES) {
+    return writeToolError(id, `❌ Máximo de ${CONFIG.MAX_READ_LINES} linhas por vez.`);
+  }
 
   try {
     const stat = await fs.promises.stat(filePath);
@@ -769,7 +1177,10 @@ async function executeReadLines(id, args) {
     }
 
     writeResult(id, {
-      content: [{ type: 'text', text: `${filePath} — linhas ${startLine}-${Math.min(endLine, lineNum)}:\n\n${lines.join('\n')}` }]
+      content: [{
+        type: 'text',
+        text: `${filePath} — linhas ${startLine}-${Math.min(endLine, lineNum)}:\n\n${lines.join('\n')}`
+      }]
     });
   } catch (err) {
     writeToolError(id, `❌ Erro: ${err.message}`);
@@ -777,7 +1188,7 @@ async function executeReadLines(id, args) {
 }
 
 // =============================================================================
-// TOOL: find_files (OTIMIZADO)
+// TOOL: find_files
 // =============================================================================
 
 async function executeFindFiles(id, args) {
@@ -788,11 +1199,12 @@ async function executeFindFiles(id, args) {
 
   if (!pattern) return writeToolError(id, '❌ "pattern" é obrigatório.');
 
+  const safePath = validatePath(searchPath);
   const results = [];
   const hasWildcard = pattern.includes('*') || pattern.includes('?');
   const regexPattern = hasWildcard ? new RegExp(`^${pattern.replace(/\./g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.')}$`, caseSensitive ? '' : 'i') : null;
 
-  await walk(searchPath, null, null, (filePath) => {
+  await walk(safePath, null, null, (filePath) => {
     if (results.length >= maxResults || shuttingDown) return;
     const name = path.basename(filePath);
     let match = false;
@@ -812,16 +1224,19 @@ async function executeFindFiles(id, args) {
 }
 
 // =============================================================================
-// TOOL: find_symbol (busca de DECLARAÇÃO, não de uso — economia de tokens)
+// TOOL: find_symbol
 // =============================================================================
 
 function buildSymbolPatterns(name) {
   const n = escapeRegex(name);
   const mod = '(?:public|private|protected|internal|static|sealed|abstract|partial|virtual|override|async|readonly|\\s)*';
   return [
-    ['class', new RegExp(`\\b${mod}\\b(?:class|interface|struct|record)\\s+${n}\\b`)],
-    ['method', new RegExp(`\\b${mod}\\b[\\w<>\\[\\],\\.\\?]+\\s+${n}\\s*\\(`)],
-    ['property', new RegExp(`\\b${mod}\\b[\\w<>\\[\\],\\.\\?]+\\s+${n}\\s*\\{\\s*(get|set)?`)]
+    ['class', new RegExp(`\\b${mod}\\b(?:class|interface|struct|record)\\s+${n}\\b`, 'i')],
+    ['method', new RegExp(`\\b${mod}\\b(?:async\\s+)?(?:Task|void|\\w+)\\s+${n}\\s*\\(`, 'i')],
+    ['property', new RegExp(`\\b${mod}\\b(?:\\w+)\\s+${n}\\s*\\{\\s*(?:get|set)?`, 'i')],
+    ['constructor', new RegExp(`\\b(?:public|private|protected|internal)\\s+${n}\\s*\\(`, 'i')],
+    ['field', new RegExp(`\\b(?:public|private|protected|internal|readonly)\\s+\\w+\\s+${n}\\s*(?:;|=)`, 'i')],
+    ['enum', new RegExp(`\\benum\\s+${n}\\b`, 'i')]
   ];
 }
 
@@ -832,21 +1247,55 @@ async function executeFindSymbol(id, args) {
   const kind = args.kind || 'any';
   const maxResults = Math.min(args.maxResults || 100, 500);
 
-  const allPatterns = buildSymbolPatterns(name).filter(([k]) => kind === 'any' || k === kind);
-  const files = await collectFiles(searchPath, ['.cs', '.razor'], null);
+  const safePath = validatePath(searchPath);
 
-  const results = [];
+  const files = await collectFiles(safePath, ['.cs', '.razor.cs', '.razor'], null);
+
+  const relevantFiles = [];
   await runPool(files, CONFIG.CONCURRENCY, async (filePath) => {
+    try {
+      const buffer = await fs.promises.readFile(filePath);
+      const { text } = decodeBuffer(buffer);
+      if (text.toLowerCase().includes(name.toLowerCase())) {
+        relevantFiles.push(filePath);
+      }
+    } catch {}
+  });
+
+  const allPatterns = buildSymbolPatterns(name).filter(([k]) => kind === 'any' || k === kind);
+  const results = [];
+
+  await runPool(relevantFiles, CONFIG.CONCURRENCY, async (filePath) => {
     if (results.length >= maxResults || shuttingDown) return;
     let buffer;
     try { buffer = await fs.promises.readFile(filePath); } catch { return; }
     if (buffer.length > CONFIG.MAX_FILE_SIZE) return;
     const { text } = decodeBuffer(buffer);
     const lines = text.split(/\r\n|\r|\n/);
+
     for (let i = 0; i < lines.length && results.length < maxResults; i++) {
+      const line = lines[i];
+      if (line.trim().startsWith('//') || line.trim().startsWith('/*')) continue;
+
       for (const [symbolKind, regex] of allPatterns) {
-        if (regex.test(lines[i])) {
-          results.push(`${filePath}:${i + 1} [${symbolKind}] ${truncateLine(lines[i].trim())}`);
+        if (regex.test(line)) {
+          let fullText = line.trim();
+          if (symbolKind === 'method' && line.includes('(') && !line.includes(')')) {
+            let j = i + 1;
+            let methodText = line;
+            while (j < lines.length && !lines[j].includes(')')) {
+              methodText += '\n' + lines[j];
+              j++;
+            }
+            if (j < lines.length) methodText += '\n' + lines[j];
+            fullText = methodText.trim();
+          }
+          results.push({
+            file: filePath,
+            line: i + 1,
+            kind: symbolKind,
+            text: truncateLine(fullText)
+          });
           break;
         }
       }
@@ -854,10 +1303,117 @@ async function executeFindSymbol(id, args) {
   });
 
   if (results.length === 0) {
-    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma declaração de "${name}" encontrada em ${searchPath}` }] });
+    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma declaração de "${name}" encontrada em ${searchPath} (${relevantFiles.length} arquivos verificados)` }] });
   }
+
+  const output = results.map(r => `${r.file}:${r.line} [${r.kind}] ${r.text}`);
   const note = results.length >= maxResults ? `\n\n_(Truncado em ${maxResults})_` : '';
-  writeResult(id, { content: [{ type: 'text', text: `💰 ${results.length} declaração(ões) de "${name}":\n\n${results.join('\n')}${note}` }] });
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: `💰 ${results.length} declaração(ões) de "${name}" (${relevantFiles.length} arquivos verificados):\n\n${output.join('\n')}${note}`
+    }]
+  });
+}
+
+// =============================================================================
+// TOOL: get_symbol_source
+// =============================================================================
+
+async function executeGetSymbolSource(id, args) {
+  const symbolName = args.name;
+  if (!symbolName) return writeToolError(id, '❌ "name" é obrigatório.');
+  const searchPath = args.path || '.';
+  const kind = args.kind || 'any';
+
+  const safePath = validatePath(searchPath);
+
+  let filesToSearch;
+  try {
+    const stat = await fs.promises.stat(safePath);
+    if (stat.isFile()) {
+      filesToSearch = [safePath];
+    } else {
+      filesToSearch = await collectFiles(safePath, ['.cs', '.razor.cs', '.razor'], null);
+    }
+  } catch {
+    filesToSearch = await collectFiles(safePath, ['.cs', '.razor.cs', '.razor'], null);
+  }
+
+  const allPatterns = buildSymbolPatterns(symbolName).filter(([k]) => kind === 'any' || k === kind);
+
+  for (const filePath of filesToSearch) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+    if (buffer.length > CONFIG.MAX_FILE_SIZE) continue;
+    const { text } = decodeBuffer(buffer);
+    const lines = text.split(/\r\n|\r|\n/);
+
+    let startLine = -1;
+    let endLine = -1;
+    let symbolKind = '';
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      for (const [kind, regex] of allPatterns) {
+        if (regex.test(line)) {
+          startLine = i;
+          symbolKind = kind;
+          if (kind === 'method' || kind === 'class' || kind === 'property') {
+            let braceCount = 0;
+            let foundBrace = false;
+            for (let j = i; j < lines.length; j++) {
+              const current = lines[j];
+              const openBraces = (current.match(/{/g) || []).length;
+              const closeBraces = (current.match(/}/g) || []).length;
+              braceCount += openBraces - closeBraces;
+              if (openBraces > 0) foundBrace = true;
+              if (foundBrace && braceCount === 0) {
+                endLine = j;
+                break;
+              }
+            }
+            if (endLine === -1) endLine = i + 10;
+          } else {
+            endLine = i;
+          }
+          break;
+        }
+      }
+      if (startLine !== -1) break;
+    }
+
+    if (startLine !== -1) {
+      const source = lines.slice(startLine, endLine + 1).join('\n');
+      return writeResult(id, {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            status: 'success',
+            symbol: symbolName,
+            kind: symbolKind,
+            file: filePath,
+            startLine: startLine + 1,
+            endLine: endLine + 1,
+            lines: endLine - startLine + 1,
+            source: source
+          }, null, 2)
+        }]
+      });
+    }
+  }
+
+  return writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        status: 'not_found',
+        symbol: symbolName,
+        message: `❌ Símbolo "${symbolName}" não encontrado em ${searchPath}`
+      }, null, 2)
+    }]
+  });
 }
 
 // =============================================================================
@@ -868,12 +1424,13 @@ async function executeGetFileInfo(id, args) {
   const filePath = args.path;
   if (!filePath) return writeToolError(id, '❌ "path" é obrigatório.');
 
+  const safePath = validatePath(filePath);
   try {
-    const stat = await fs.promises.stat(filePath);
+    const stat = await fs.promises.stat(safePath);
     const info = {
-      path: filePath,
-      name: path.basename(filePath),
-      ext: path.extname(filePath),
+      path: safePath,
+      name: path.basename(safePath),
+      ext: path.extname(safePath),
       size: stat.size,
       sizeHuman: formatSize(stat.size),
       modified: stat.mtime.toISOString(),
@@ -883,7 +1440,7 @@ async function executeGetFileInfo(id, args) {
     };
 
     if (args.includeContent && stat.isFile() && stat.size < CONFIG.MAX_FILE_SIZE) {
-      const buffer = await fs.promises.readFile(filePath);
+      const buffer = await fs.promises.readFile(safePath);
       const { encoding } = decodeBuffer(buffer);
       info.encoding = encoding;
       info.preview = buffer.toString('utf8', 0, 500) + (stat.size > 500 ? '...' : '');
@@ -904,6 +1461,13 @@ async function executeListDirectory(id, args) {
   const recursive = args.recursive || false;
   const maxDepth = Math.min(args.maxDepth || 3, 10);
 
+  const safePath = validatePath(searchPath);
+  const cacheKey = `${safePath}:${recursive}:${maxDepth}`;
+  const cached = dirCache.get(cacheKey);
+  if (cached) {
+    return writeResult(id, { content: [{ type: 'text', text: `📂 ${searchPath} (cached)\n\n${cached}` }] });
+  }
+
   async function walkDir(dir, depth = 0, prefix = '') {
     if (depth > maxDepth || shuttingDown) return [];
     let dirents;
@@ -919,7 +1483,7 @@ async function executeListDirectory(id, args) {
       });
 
     for (const dirent of sorted) {
-      if (CONFIG.IGNORE_DIRS.has(dirent.name)) continue;
+      if (isIgnoredDir(dirent.name)) continue;
       const isDir = dirent.isDirectory();
       const icon = isDir ? '📁' : '📄';
       items.push(`${prefix}${icon} ${dirent.name}${isDir ? '/' : ''}`);
@@ -930,8 +1494,269 @@ async function executeListDirectory(id, args) {
     return items;
   }
 
-  const items = await walkDir(searchPath);
-  writeResult(id, { content: [{ type: 'text', text: `📂 ${searchPath}\n\n${items.join('\n') || '(vazio)'}` }] });
+  const items = await walkDir(safePath);
+  const result = items.join('\n') || '(vazio)';
+  dirCache.set(cacheKey, result);
+
+  writeResult(id, { content: [{ type: 'text', text: `📂 ${searchPath}\n\n${result}` }] });
+}
+
+// =============================================================================
+// TOOL: write_file
+// =============================================================================
+
+async function executeWriteFile(id, args) {
+  const filePath = args.path;
+  const content = args.content;
+  const encoding = args.encoding || 'utf8';
+  const createDirs = args.createDirs !== false;
+  const overwrite = args.overwrite !== false;
+  const backup = args.backup !== false;
+
+  if (!filePath) return writeToolError(id, '❌ "path" é obrigatório.');
+  if (content === undefined) return writeToolError(id, '❌ "content" é obrigatório.');
+
+  const size = Buffer.byteLength(content, encoding);
+  if (size > CONFIG.MAX_WRITE_SIZE) {
+    return writeToolError(id, `❌ Arquivo muito grande: ${formatSize(size)}. Máximo: ${formatSize(CONFIG.MAX_WRITE_SIZE)}`);
+  }
+
+  const safePath = validatePath(filePath);
+  logOperation('write_file', safePath);
+
+  try {
+    let existingBuffer = null;
+    try {
+      existingBuffer = await fs.promises.readFile(safePath);
+    } catch {}
+
+    if (existingBuffer && !overwrite) {
+      return writeToolError(id, `❌ Arquivo já existe: ${safePath}. Use overwrite:true para sobrescrever.`);
+    }
+
+    let backupPath = null;
+    if (existingBuffer && backup) {
+      const result = await writeBackup(safePath, existingBuffer);
+      if (!result.ok) {
+        return writeToolError(id, `❌ Falha no backup (arquivo existente não foi tocado): ${result.error.message}`);
+      }
+      backupPath = result.bakPath;
+    }
+
+    if (createDirs) {
+      const dir = path.dirname(safePath);
+      await fs.promises.mkdir(dir, { recursive: true });
+    }
+
+    await fs.promises.writeFile(safePath, content, encoding);
+    const stat = await fs.promises.stat(safePath);
+    cleanOldBackups(path.dirname(safePath)).catch(() => {});
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'success',
+          path: safePath,
+          size: stat.size,
+          backup: backupPath,
+          message: `✅ Arquivo escrito com sucesso: ${safePath} (${formatSize(stat.size)})${backupPath ? ` (backup: ${backupPath})` : ''}`
+        }, null, 2)
+      }]
+    });
+  } catch (err) {
+    writeToolError(id, `❌ Erro ao escrever arquivo: ${err.message}`);
+  }
+}
+
+// =============================================================================
+// TOOL: edit_file
+// =============================================================================
+
+async function executeEditFile(id, args) {
+  const filePath = args.path;
+  const newContent = args.content;
+  const dryRun = args.dryRun !== false;
+  const backup = args.backup !== false;
+
+  if (!filePath) return writeToolError(id, '❌ "path" é obrigatório.');
+  if (newContent === undefined) return writeToolError(id, '❌ "content" é obrigatório.');
+
+  const safePath = validatePath(filePath);
+  logOperation('edit_file', safePath);
+
+  try {
+    let originalContent = '';
+    let exists = true;
+    let originalBuffer = null;
+    try {
+      originalBuffer = await fs.promises.readFile(safePath);
+      originalContent = originalBuffer.toString('utf8');
+    } catch {
+      exists = false;
+      originalContent = '';
+    }
+
+    if (!exists && dryRun) {
+      return writeResult(id, {
+        content: [{
+          type: 'text',
+          text: `📋 Arquivo não existe: ${safePath}\n\n_(DryRun — seria criado com o novo conteúdo.)_`
+        }]
+      });
+    }
+
+    const diff = buildDiffPreview(originalContent, newContent);
+
+    if (dryRun) {
+      return writeResult(id, {
+        content: [{
+          type: 'text',
+          text: `📋 Preview de edição: ${safePath}\n\n${diff.preview}\n\n_(DryRun — nenhuma alteração foi aplicada. Rode com dryRun:false para aplicar.)_`
+        }]
+      });
+    }
+
+    let backupPath = null;
+    if (backup && exists && originalBuffer) {
+      const result = await writeBackup(safePath, originalBuffer);
+      if (!result.ok) {
+        return writeToolError(id, `❌ Falha no backup: ${result.error.message}`);
+      }
+      backupPath = result.bakPath;
+    }
+
+    await fs.promises.writeFile(safePath, newContent, 'utf8');
+
+    cleanOldBackups(path.dirname(safePath)).catch(() => {});
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'success',
+          path: safePath,
+          backup: backupPath,
+          diff: diff.preview,
+          message: `✅ Arquivo editado com sucesso: ${safePath}${backupPath ? ` (backup: ${backupPath})` : ''}`
+        }, null, 2)
+      }]
+    });
+  } catch (err) {
+    writeToolError(id, `❌ Erro ao editar arquivo: ${err.message}`);
+  }
+}
+
+// =============================================================================
+// TOOL: create_directory
+// =============================================================================
+
+async function executeCreateDirectory(id, args) {
+  const dirPath = args.path;
+  const recursive = args.recursive !== false;
+
+  if (!dirPath) return writeToolError(id, '❌ "path" é obrigatório.');
+
+  const safePath = validatePath(dirPath);
+  logOperation('create_directory', safePath);
+
+  try {
+    try {
+      const stat = await fs.promises.stat(safePath);
+      if (stat.isDirectory()) {
+        return writeResult(id, {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              status: 'exists',
+              path: safePath,
+              message: `📁 Diretório já existe: ${safePath}`
+            }, null, 2)
+          }]
+        });
+      }
+    } catch {}
+
+    await fs.promises.mkdir(safePath, { recursive });
+    const stat = await fs.promises.stat(safePath);
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'success',
+          path: safePath,
+          message: `✅ Diretório criado com sucesso: ${safePath}`
+        }, null, 2)
+      }]
+    });
+  } catch (err) {
+    writeToolError(id, `❌ Erro ao criar diretório: ${err.message}`);
+  }
+}
+
+// =============================================================================
+// TOOL: move_file
+// =============================================================================
+
+async function executeMoveFile(id, args) {
+  const source = args.source;
+  const destination = args.destination;
+  const overwrite = args.overwrite !== false;
+  const backup = args.backup !== false;
+
+  if (!source) return writeToolError(id, '❌ "source" é obrigatório.');
+  if (!destination) return writeToolError(id, '❌ "destination" é obrigatório.');
+
+  const safeSource = validatePath(source);
+  const safeDest = validatePath(destination);
+
+  logOperation('move_file', `${safeSource} → ${safeDest}`);
+
+  try {
+    await fs.promises.access(safeSource, fs.constants.F_OK);
+    const stat = await fs.promises.stat(safeSource);
+
+    let destExists = false;
+    try {
+      await fs.promises.access(safeDest, fs.constants.F_OK);
+      destExists = true;
+    } catch {}
+
+    if (destExists && !overwrite) {
+      return writeToolError(id, `❌ Arquivo de destino já existe: ${safeDest}. Use overwrite:true para sobrescrever.`);
+    }
+
+    const destDir = path.dirname(safeDest);
+    await fs.promises.mkdir(destDir, { recursive: true });
+
+    let backupPath = null;
+    if (destExists && backup) {
+      const destBuffer = await fs.promises.readFile(safeDest);
+      const result = await writeBackup(safeDest, destBuffer);
+      if (!result.ok) {
+        return writeToolError(id, `❌ Falha no backup: ${result.error.message}`);
+      }
+      backupPath = result.bakPath;
+    }
+
+    await fs.promises.rename(safeSource, safeDest);
+
+    writeResult(id, {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          status: 'success',
+          source: safeSource,
+          destination: safeDest,
+          backup: backupPath,
+          message: `✅ Arquivo movido com sucesso: ${safeSource} → ${safeDest}${backupPath ? ` (backup: ${backupPath})` : ''}`
+        }, null, 2)
+      }]
+    });
+  } catch (err) {
+    writeToolError(id, `❌ Erro ao mover arquivo: ${err.message}`);
+  }
 }
 
 // =============================================================================
@@ -1088,7 +1913,8 @@ async function executeGenerateLabels(id, args) {
   const targetPath = args.path;
   if (!targetPath) return writeToolError(id, '❌ "path" é obrigatório.');
 
-  const razorFiles = await collectFiles(targetPath, ['.razor'], null);
+  const safePath = validatePath(targetPath);
+  const razorFiles = await collectFiles(safePath, ['.razor'], null);
   if (razorFiles.length === 0) {
     return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhum .razor em ${targetPath}` }] });
   }
@@ -1117,7 +1943,7 @@ async function executeGenerateLabels(id, args) {
     return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma Loc["..."] encontrada.` }] });
   }
 
-  const resxBase = args.resxPath ? path.resolve(args.resxPath) : await findResxFolder(targetPath);
+  const resxBase = args.resxPath ? path.resolve(args.resxPath) : await findResxFolder(safePath);
   const resxData = {};
   for (const lang of RESX_LANGS) {
     const filePath = path.join(resxBase, `SharedResources.${lang}.resx`);
@@ -1165,12 +1991,13 @@ async function executeInsertTranslations(id, args) {
     return writeToolError(id, '❌ "translations" é obrigatório.');
   }
 
+  const safePath = validatePath(targetPath);
   const results = [];
   let totalInserted = 0;
 
   for (const [lang, keyValues] of Object.entries(translations)) {
     if (!RESX_LANGS.includes(lang)) continue;
-    const filePath = path.join(targetPath, `SharedResources.${lang}.resx`);
+    const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
     let fileExists = false;
     let text = '';
     let buffer = null;
@@ -1240,7 +2067,7 @@ async function executeInsertTranslations(id, args) {
 
     if (!dryRun) {
       if (backup && buffer) await writeBackup(filePath, buffer);
-      await fs.promises.mkdir(targetPath, { recursive: true });
+      await fs.promises.mkdir(safePath, { recursive: true });
       await fs.promises.writeFile(filePath, newContent, 'utf8');
       results[results.length - 1].written = true;
     }
@@ -1259,7 +2086,8 @@ async function executeInsertTranslations(id, args) {
 
 async function executeGetTranslationContext(id, args) {
   const { path: targetPath, keys: specificKeys } = args;
-  const razorFiles = await collectFiles(targetPath, ['.razor'], null);
+  const safePath = validatePath(targetPath);
+  const razorFiles = await collectFiles(safePath, ['.razor'], null);
   const context = {};
   for (const file of razorFiles) {
     let buffer;
@@ -1277,10 +2105,11 @@ async function executeGetTranslationContext(id, args) {
 
 async function executeGetExistingTranslations(id, args) {
   const { path: targetPath, language, keys: specificKeys } = args;
+  const safePath = validatePath(targetPath);
   const translations = {};
   const langs = language ? [language] : RESX_LANGS;
   for (const lang of langs) {
-    const filePath = path.join(targetPath, `SharedResources.${lang}.resx`);
+    const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
     try {
       const buffer = await fs.promises.readFile(filePath);
       const { text } = decodeBuffer(buffer);
@@ -1297,7 +2126,8 @@ async function executeGetExistingTranslations(id, args) {
 
 async function executeDeduplicateResx(id, args) {
   const { path: targetPath, dryRun = true, backup = true, keepFirst = true } = args;
-  const files = await collectFiles(targetPath, ['.resx'], null);
+  const safePath = validatePath(targetPath);
+  const files = await collectFiles(safePath, ['.resx'], null);
   const results = [];
   for (const filePath of files) {
     let buffer;
@@ -1319,7 +2149,8 @@ async function executeDeduplicateResx(id, args) {
 
 async function executeFindDuplicates(id, args) {
   const { path: targetPath } = args;
-  const files = await collectFiles(targetPath, ['.resx'], null);
+  const safePath = validatePath(targetPath);
+  const files = await collectFiles(safePath, ['.resx'], null);
   const results = [];
   for (const filePath of files) {
     try {
@@ -1339,12 +2170,13 @@ async function executeAddLanguage(id, args) {
   if (!/^[a-z]{2}-[A-Z]{2}$/.test(language)) {
     return writeToolError(id, 'Formato inválido. Use: pt-BR, en-US, etc.');
   }
-  const filePath = path.join(targetPath, `SharedResources.${language}.resx`);
+  const safePath = validatePath(targetPath);
+  const filePath = path.join(safePath, `SharedResources.${language}.resx`);
   try {
     await fs.promises.stat(filePath);
     return writeResult(id, { content: [{ type: 'text', text: `Idioma ${language} já existe` }] });
   } catch {}
-  const sourceFilePath = path.join(targetPath, `SharedResources.${sourceLanguage}.resx`);
+  const sourceFilePath = path.join(safePath, `SharedResources.${sourceLanguage}.resx`);
   let keys = [];
   try {
     const buffer = await fs.promises.readFile(sourceFilePath);
@@ -1358,7 +2190,7 @@ async function executeAddLanguage(id, args) {
   }
   if (!dryRun) {
     const template = createResxTemplate(language, keys);
-    await fs.promises.mkdir(targetPath, { recursive: true });
+    await fs.promises.mkdir(safePath, { recursive: true });
     await fs.promises.writeFile(filePath, template, 'utf8');
   }
   writeResult(id, { content: [{ type: 'text', text: JSON.stringify({ status: dryRun ? 'preview' : 'created', language, keysCount: keys.length, dryRun }, null, 2) }] });
@@ -1381,7 +2213,7 @@ async function walk(dir, fileExts, excludeExts, onFileFound) {
     if (dirent.isSymbolicLink()) continue;
     const fullPath = path.join(dir, dirent.name);
     if (dirent.isDirectory()) {
-      if (!CONFIG.IGNORE_DIRS.has(dirent.name)) {
+      if (!isIgnoredDir(dirent.name)) {
         await walk(fullPath, fileExts, excludeExts, onFileFound);
       }
     } else if (dirent.isFile()) {
@@ -1393,7 +2225,7 @@ async function walk(dir, fileExts, excludeExts, onFileFound) {
       if (excludeExts && excludeExts.length > 0) {
         excluded = excludeExts.some(ext => dirent.name.endsWith(ext));
       }
-      if (matchesExt && !excluded) {
+      if (matchesExt && !excluded && !isExcludedFile(dirent.name)) {
         onFileFound(fullPath);
       }
     }
@@ -1451,8 +2283,30 @@ function buildDiffPreview(original, updated) {
 
 async function writeBackup(filePath, buffer) {
   const bakPath = `${filePath}.bak.${Date.now()}`;
-  await fs.promises.writeFile(bakPath, buffer);
-  return { ok: true, bakPath };
+  try {
+    await fs.promises.writeFile(bakPath, buffer);
+    return { ok: true, bakPath };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
+async function cleanOldBackups(dir, maxAge = CONFIG.BACKUP_MAX_AGE) {
+  try {
+    const files = await fs.promises.readdir(dir);
+    const now = Date.now();
+    for (const file of files) {
+      if (/\.bak\.\d+$/.test(file)) {
+        const fullPath = path.join(dir, file);
+        try {
+          const stat = await fs.promises.stat(fullPath);
+          if (now - stat.mtimeMs > maxAge) {
+            await fs.promises.unlink(fullPath);
+          }
+        } catch {}
+      }
+    }
+  } catch {}
 }
 
 async function runPool(items, limit, worker) {

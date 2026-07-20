@@ -1,0 +1,38 @@
+{
+  "allowedRoots": [],
+  "excludeDirs": [
+    "backup",
+    "_backup",
+    "bin",
+    "obj",
+    "node_modules",
+    ".git",
+    ".vs",
+    ".idea",
+    "TestResults",
+    "packages",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    "Migrations",
+    "ebook",
+    "wwwroot",
+    "dist",
+    "logs"
+  ],
+  "excludeFilePatterns": [
+    "*.Designer.cs",
+    "*.g.cs",
+    "*.g.i.cs",
+    "*.min.js",
+    "*.sql",
+    "*.bak*",
+    "*.rar",
+    "*.zip",
+    "*.log",
+    "*.tmp",
+    "*.cache"
+  ]
+}
