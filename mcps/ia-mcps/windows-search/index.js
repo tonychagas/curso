@@ -123,6 +123,7 @@ const TOOL_PROFILES = {
     'deduplicate_resx',
     'find_duplicates',
     'add_language',
+    'fix_mojibake',
     'compact_command',
     'undo_last_change',
     'code_outline',
@@ -793,6 +794,11 @@ class SmartCache {
       this.misses++;
       return null;
     }
+    // LRU real: Map preserva ordem de inserção, então mover a chave pro fim
+    // faz com que set() (que remove sempre a primeira chave) descarte a
+    // menos recentemente usada, não a mais antiga por inserção.
+    this.cache.delete(key);
+    this.cache.set(key, entry);
     this.hits++;
     return entry.value;
   }
@@ -864,6 +870,12 @@ function invalidateCachePaths(targetPath) {
     for (const [key] of dirCache.cache) {
         if (key.startsWith(normalized) || key === normalized) {
             dirCache.cache.delete(key);
+        }
+    }
+
+    for (const [key] of searchCache.cache) {
+        if (key.startsWith(normalized) || key === normalized) {
+            searchCache.cache.delete(key);
         }
     }
 }
@@ -1030,6 +1042,7 @@ async function handleLine(raw) {
         case 'deduplicate_resx': await executeDeduplicateResx(id, toolArgs); break;
         case 'find_duplicates': await executeFindDuplicates(id, toolArgs); break;
         case 'add_language': await executeAddLanguage(id, toolArgs); break;
+        case 'fix_mojibake': await executeFixMojibake(id, toolArgs); break;
         default: writeToolError(id, `Tool not found: ${toolName}`);
       }
       const duration = Date.now() - startTime;
@@ -1660,6 +1673,21 @@ const ALL_TOOL_DEFINITIONS = {
       },
       required: ['path', 'language']
     }
+  },
+
+  fix_mojibake: {
+    name: 'fix_mojibake',
+    description: 'Detecta e corrige mojibake (acentos corrompidos por double-encoding UTF-8, ex: "Ã§Ã£o" em vez de "ção") em .resx e outros arquivos de texto. Só corrige quando confirma que reduz o número de sequências suspeitas e não introduz caracteres inválidos — se não tiver certeza, não mexe no arquivo.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Arquivo ou diretório a verificar' },
+        extensions: { type: 'array', description: 'Extensões a verificar (default: [".resx"])', items: { type: 'string' } },
+        dryRun: { type: 'boolean', description: 'Preview sem alterar. Default: true' },
+        backup: { type: 'boolean', description: 'Criar backup antes de corrigir. Default: true' }
+      },
+      required: ['path']
+    }
   }
 };
 
@@ -1740,6 +1768,18 @@ async function executeSearchContent(id, args) {
   if (!pattern) {
     return writeToolError(id, '❌ Parâmetro "pattern" é obrigatório.');
   }
+
+  // Cache de resultado de busca (TTL curto de 10s — searchCache já existia mas nunca era usado).
+  // A chave começa com o path normalizado pra invalidateCachePaths conseguir limpar em writes.
+  let cacheKey = null;
+  try {
+    const normalizedForCache = path.normalize(path.resolve(searchPath));
+    cacheKey = `${normalizedForCache}|${pattern}|${fileExts || ''}|${excludeExts || ''}|${simpleMatch}|${caseSensitive}|${context}|${maxResults}`;
+    const cached = searchCache.get(cacheKey);
+    if (cached) {
+      return writeResult(id, { content: [{ type: 'text', text: `${cached}\n\n_(cache)_` }] });
+    }
+  } catch { /* se der erro montando a chave, só segue sem cache */ }
 
   try {
     const stat = await fs.promises.stat(searchPath);
@@ -1838,18 +1878,18 @@ async function executeSearchContent(id, args) {
   });
 
   if (results.length === 0) {
-    return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhuma ocorrência de "${pattern}" em ${files.length} arquivo(s)` }] });
+    const emptyText = `📋 Nenhuma ocorrência de "${pattern}" em ${files.length} arquivo(s)`;
+    if (cacheKey) searchCache.set(cacheKey, emptyText);
+    return writeResult(id, { content: [{ type: 'text', text: emptyText }] });
   }
 
   const output = results.map(r => r.text + (r.after.length ? ` | after=[${r.after.join('│')}]` : ''));
   const note = isTruncated ? `\n\n_(Truncado em ${maxResults} resultados. Use filtro mais específico.)_` : '';
+  const finalText = `🔍 Encontradas ${totalFound} ocorrência(s) de "${pattern}" em ${searchPath} (${files.length} arquivos)\n\n${output.join('\n')}${note}`;
 
-  writeResult(id, {
-    content: [{
-      type: 'text',
-      text: `🔍 Encontradas ${totalFound} ocorrência(s) de "${pattern}" em ${searchPath} (${files.length} arquivos)\n\n${output.join('\n')}${note}`
-    }]
-  });
+  if (cacheKey) searchCache.set(cacheKey, finalText);
+
+  writeResult(id, { content: [{ type: 'text', text: finalText }] });
 }
 
 async function executeRipgrepSearch(id, searchPath, pattern, fileExts, excludeExts, simpleMatch, caseSensitive, context, maxResults) {
@@ -1930,10 +1970,13 @@ function buildSymbolPatterns(name) {
     ['property', new RegExp(`\\b${mod}\\b(?:\\w+)\\s+${n}\\s*\\{\\s*(?:get|set)?`, 'i')],
     // Construtores
     ['constructor', new RegExp(`\\b(?:public|private|protected|internal)\\s+${n}\\s*\\(`, 'i')],
-    // Campos
-    ['field', new RegExp(`\\b(?:public|private|protected|internal|readonly)\\s+\\w+\\s+${n}\\s*(?:;|=)`, 'i')],
+    // Campos (o lookahead (?!>) evita casar 'Total => 5' como campo, deixando pro padrão de property abaixo)
+    ['field', new RegExp(`\\b(?:public|private|protected|internal|readonly)\\s+\\w+\\s+${n}\\s*(?:;|=(?!>))`, 'i')],
     // Enums
-    ['enum', new RegExp(`\\benum\\s+${n}\\b`, 'i')]
+    ['enum', new RegExp(`\\benum\\s+${n}\\b`, 'i')],
+    // Expression-bodied members: public int Total => items.Count;
+    ['method', new RegExp(`\\b${mod}\\b(?:async\\s+)?\\w+\\s+${n}\\s*\\([^)]*\\)\\s*=>`, 'i')],
+    ['property', new RegExp(`\\b${mod}\\b\\w+\\s+${n}\\s*=>`, 'i')]
   ];
 }
 
@@ -2943,7 +2986,7 @@ async function executeUndoLastChange(id, args) {
         return writeResult(id, {
             content: [{
                 type: 'text',
-                text: `↩️ Preview de rollback: ${safePath}\n\nBackup: ${path.basename(selectedBackup.path)}\nTimestamp: ${new Date(selectedBackup.timestamp).toISOString()}\n\n${diff.preview}\n\n_(DryRun — nenhuma alteração foi aplicada. Rode com dryRun:false para restaurar.)_`
+                text: `↩️ Preview de rollback: ${safePath}\n\nBackup: ${path.basename(selectedBackup.path)}\nTimestamp: ${new Date(Math.floor(selectedBackup.timestamp / 1000)).toISOString()}\n\n${diff.preview}\n\n_(DryRun — nenhuma alteração foi aplicada. Rode com dryRun:false para restaurar.)_`
             }]
         });
     }
@@ -4830,6 +4873,17 @@ async function executeFindUnusedCode(id, args) {
 // FEATURES FALTANTES - analyze_complexity (v8.5.0)
 // =============================================================================
 
+function stripCommentsAndStrings(text) {
+  // Remove comentários de linha e bloco, e o conteúdo de strings/chars,
+  // pra não contar 'if'/'for' etc que apareçam dentro deles.
+  return text
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/"""[\s\S]*?"""/g, '""')       // raw strings C# 11+
+    .replace(/\$?@?"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''");
+}
+
 async function executeAnalyzeComplexity(id, args) {
   const searchPath = args.path;
   const threshold = args.threshold || 10;
@@ -4854,7 +4908,8 @@ async function executeAnalyzeComplexity(id, args) {
   for (const file of files) {
     try {
       const buffer = await fs.promises.readFile(file);
-      const { text } = decodeBuffer(buffer);
+      const { text: rawText } = decodeBuffer(buffer);
+      const text = stripCommentsAndStrings(rawText);
       const lines = text.split('\n');
 
       let cyclomaticComplexity = 0;
@@ -4862,15 +4917,14 @@ async function executeAnalyzeComplexity(id, args) {
       let nestingDepth = 0;
       let maxNesting = 0;
 
-      const decisionKeywords = ['if', 'else if', 'for', 'foreach', 'while', 'do', 'switch', 'case', 'catch', '&&', '||', '?'];
-      
+      // \b garante palavra inteira: não casa 'if' dentro de 'Identifier', 'Modified' etc.
+      // 'foreach' é checado antes de 'for' pra não contar as duas em cima da mesma ocorrência.
+      const decisionRegex = /\bforeach\b|\bfor\b|\bif\b|\belse\s+if\b|\bwhile\b|\bdo\b|\bswitch\b|\bcase\b|\bcatch\b|&&|\|\||\?(?!\?|\.)/g;
+
       for (const line of lines) {
-        const trimmed = line.trim();
-        for (const keyword of decisionKeywords) {
-          if (trimmed.includes(keyword)) {
-            cyclomaticComplexity++;
-          }
-        }
+        const matches = line.match(decisionRegex);
+        if (matches) cyclomaticComplexity += matches.length;
+
         const openBraces = (line.match(/{/g) || []).length;
         const closeBraces = (line.match(/}/g) || []).length;
         nestingDepth += openBraces - closeBraces;
@@ -4995,20 +5049,68 @@ async function isLikelyBinary(filePath) {
     '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
   ]);
   if (BINARY_EXT.has(path.extname(filePath).toLowerCase())) return true;
+
+  // fs.promises.readFile NÃO aceita a opção "length" (isso só existe em fs.read/fs.readSync
+  // com handle). O código antigo lia o arquivo inteiro sempre; aqui lemos de fato só os
+  // primeiros 512 bytes via file handle.
+  let handle;
   try {
-    const buffer = await fs.promises.readFile(filePath, { length: 512 });
-    return buffer.includes(0);
-  } catch { return true; }
+    handle = await fs.promises.open(filePath, 'r');
+    const buffer = Buffer.alloc(512);
+    const { bytesRead } = await handle.read(buffer, 0, 512, 0);
+    return buffer.subarray(0, bytesRead).includes(0);
+  } catch {
+    return true;
+  } finally {
+    if (handle) { try { await handle.close(); } catch {} }
+  }
 }
 
+// Tabela real do Windows-1252 pro intervalo 0x80-0x9F, onde ele diverge do Latin-1/ISO-8859-1
+// (nesse intervalo o Latin-1 tem caracteres de controle C1 que não são usados na prática;
+// o CP1252 usa esse espaço pra aspas curvas, travessão, €, etc. — comum em arquivos salvos
+// por editores/ferramentas Windows antigas, como FastReport .frx e .resx legados)
+const CP1252_MAP = {
+  0x80: '\u20AC', 0x82: '\u201A', 0x83: '\u0192', 0x84: '\u201E',
+  0x85: '\u2026', 0x86: '\u2020', 0x87: '\u2021', 0x88: '\u02C6',
+  0x89: '\u2030', 0x8A: '\u0160', 0x8B: '\u2039', 0x8C: '\u0152',
+  0x8E: '\u017D', 0x91: '\u2018', 0x92: '\u2019', 0x93: '\u201C',
+  0x94: '\u201D', 0x95: '\u2022', 0x96: '\u2013', 0x97: '\u2014',
+  0x98: '\u02DC', 0x99: '\u2122', 0x9A: '\u0161', 0x9B: '\u203A',
+  0x9C: '\u0153', 0x9E: '\u017E', 0x9F: '\u0178'
+};
+
+function decodeWindows1252(buffer) {
+  let out = '';
+  for (let i = 0; i < buffer.length; i++) {
+    const b = buffer[i];
+    out += CP1252_MAP[b] || String.fromCharCode(b); // 0x00-0x7F e 0xA0-0xFF coincidem com Latin-1
+  }
+  return out;
+}
+
+const utf8StrictDecoder = new TextDecoder('utf-8', { fatal: true });
+
 function decodeBuffer(buffer, overrideEncoding = null) {
-  let encoding = overrideEncoding || 'utf-8';
   let hadBom = false;
   if (buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
     hadBom = true;
     buffer = buffer.subarray(3);
   }
-  return { text: buffer.toString(encoding), encoding, hadBom };
+
+  if (overrideEncoding) {
+    return { text: buffer.toString(overrideEncoding), encoding: overrideEncoding, hadBom };
+  }
+
+  try {
+    // fatal:true faz REJEITAR bytes inválidos em vez de virar '�' silenciosamente
+    // (que é o que buffer.toString('utf-8') fazia antes, perdendo a informação original)
+    const text = utf8StrictDecoder.decode(buffer);
+    return { text, encoding: 'utf-8', hadBom };
+  } catch {
+    // Bytes não são UTF-8 válido -> quase certo que é Windows-1252 (caso comum em .resx/.frx antigos)
+    return { text: decodeWindows1252(buffer), encoding: 'windows-1252 (auto-detectado)', hadBom };
+  }
 }
 
 function truncateLine(line) {
@@ -5042,8 +5144,12 @@ function buildDiffPreview(original, updated) {
   return { preview: diffs.join('\n'), eolNote };
 }
 
+let _backupCounter = 0;
 async function writeBackup(filePath, buffer) {
-  const bakPath = `${filePath}.bak.${Date.now()}`;
+  // Date.now() sozinho pode colidir se o mesmo arquivo for salvo 2x no mesmo milissegundo
+  // (ex: duas chamadas seguidas no mesmo turno do Cline), sobrescrevendo o backup anterior
+  // silenciosamente. O contador garante nome único mesmo nesse caso.
+  const bakPath = `${filePath}.bak.${Date.now()}${(_backupCounter++ % 1000).toString().padStart(3, '0')}`;
   try {
     await fs.promises.writeFile(bakPath, buffer);
     return { ok: true, bakPath };
@@ -5579,58 +5685,6 @@ function removeDuplicates(text, keepFirst = true) {
 
 
 
-async function executeDeduplicateResx(id, args) {
-  const { path: targetPath, dryRun = true, backup = true, keepFirst = true } = args;
-  const safePath = validatePath(targetPath);
-  const files = await collectFiles(safePath, ['.resx'], null);
-  const results = [];
-  let totalRemoved = 0;
-  
-  for (const filePath of files) {
-    let buffer;
-    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
-    const { text } = decodeBuffer(buffer);
-    const dupInfo = findDuplicateKeysWithPositions(text);
-    if (dupInfo.duplicates.length === 0) continue;
-    
-    if (!dryRun) {
-      if (backup) await writeBackup(filePath, buffer);
-      const clean = removeDuplicates(text, keepFirst);
-      await fs.promises.writeFile(filePath, clean.cleanedText, 'utf8');
-      totalRemoved += clean.removed;
-      results.push({ 
-        file: filePath, 
-        removed: clean.removed, 
-        keys: clean.removedKeys,
-        preview: clean.removedKeys.map(k => `  - ${k}`).join('\n')
-      });
-    } else {
-      // ✅ Preview com mais detalhes
-      results.push({ 
-        file: filePath, 
-        duplicates: dupInfo.duplicates, 
-        count: dupInfo.totalDuplicateOccurrences, 
-        dryRun: true,
-        preview: dupInfo.duplicates.map(k => `  - ${k}`).join('\n'),
-        suggestion: `Use dryRun:false para remover ${dupInfo.duplicates.length} chave(s) duplicada(s)`
-      });
-    }
-  }
-  
-  const summary = {
-    status: 'success',
-    dryRun,
-    totalFiles: results.length,
-    totalRemoved,
-    results: results.slice(0, 20),
-    message: dryRun 
-      ? `📋 Preview: ${results.length} arquivo(s) com duplicatas. ${totalRemoved} chave(s) seriam removidas.`
-      : `✅ ${results.length} arquivo(s) processados. ${totalRemoved} chave(s) duplicada(s) removidas.`
-  };
-  
-  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
-}
-
 async function executeFindDuplicates(id, args) {
   const { path: targetPath } = args;
   const safePath = validatePath(targetPath);
@@ -5678,6 +5732,178 @@ async function executeAddLanguage(id, args) {
     await fs.promises.writeFile(filePath, template, 'utf8');
   }
   writeResult(id, { content: [{ type: 'text', text: JSON.stringify({ status: dryRun ? 'preview' : 'created', language, keysCount: keys.length, dryRun }, null, 2) }] });
+}
+
+// =============================================================================
+// FIX_MOJIBAKE — repara N níveis de "double-encoding" (arquivo já é UTF-8
+// válido, mas o conteúdo foi corrompido 1x, 2x (tripla codificação) ou mais
+// vezes por alguma ferramenta que salvou como UTF-8, reabriu como Windows-1252
+// por engano, e resalvou). Diferente do fallback do decodeBuffer, que resolve
+// o caso de o ARQUIVO em si estar puro Windows-1252 no disco.
+// =============================================================================
+
+// Mapeamento reverso do CP1252_MAP (definido lá em cima, perto do decodeBuffer):
+// caractere especial -> byte original. É o que faz a reversão funcionar de
+// verdade pra 2+ níveis de corrupção — Latin-1 puro não tem esses caracteres
+// (€, ƒ, ", ", •, etc.), só o Windows-1252 tem, e é o CP1252 que as ferramentas
+// do Windows usam quando abrem um arquivo com o encoding errado.
+const CP1252_REVERSE = {};
+for (const [byteStr, char] of Object.entries(CP1252_MAP)) {
+  CP1252_REVERSE[char] = Number(byteStr);
+}
+
+// Reverte pro byte original assumindo que 'text' foi decodificado como CP1252.
+// Devolve null se algum caractere não couber num byte (sinal de que o texto
+// não é mais mojibake reversível nesse nível — para a cadeia com segurança).
+function encodeAsWindows1252(text) {
+  const bytes = Buffer.alloc(text.length);
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const special = CP1252_REVERSE[ch];
+    if (special !== undefined) {
+      bytes[i] = special;
+    } else {
+      const code = ch.codePointAt(0);
+      if (code > 0xFF) return null;
+      bytes[i] = code;
+    }
+  }
+  return bytes;
+}
+
+// Sinais de corrupção: 'Ã'/'Â' seguido de continuação normal (0xA0-0xBF) OU
+// de um dos caracteres especiais do CP1252 (ƒ, €, ", —, etc. — é o que aparece
+// quando há 2+ níveis de corrupção, tipo "ÃƒÂ¡" em vez de "á").
+const CP1252_SPECIALS_CLASS = Object.values(CP1252_MAP)
+  .map(ch => ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('');
+const MOJIBAKE_PATTERN = new RegExp(`[ÃÂ][${CP1252_SPECIALS_CLASS}\\u00A0-\\u00BF]`, 'g');
+
+function countMojibake(text) {
+  const matches = text.match(MOJIBAKE_PATTERN);
+  return matches ? matches.length : 0;
+}
+
+// Só devolve texto reparado se tiver certeza de que melhorou: cada passo exige
+// que o resultado seja UTF-8 estritamente válido (decoder 'fatal:true' — se não
+// for, aborta ali, sem arriscar corromper mais) e que reduza sequências
+// suspeitas. Repete até 4x pra cobrir corrupção dupla, tripla ou além, sem
+// risco de loop infinito porque só continua enquanto a pontuação melhora.
+function tryRepairMojibake(text) {
+  const originalScore = countMojibake(text);
+  if (originalScore === 0) return null;
+
+  let current = text;
+  let currentScore = originalScore;
+
+  for (let pass = 0; pass < 4; pass++) {
+    const bytes = encodeAsWindows1252(current);
+    if (!bytes) break;
+
+    let candidate;
+    try {
+      candidate = utf8StrictDecoder.decode(bytes);
+    } catch {
+      break; // não é UTF-8 válido nesse nível -> já passou do ponto de reversão segura
+    }
+
+    const candidateScore = countMojibake(candidate);
+    if (candidateScore < currentScore) {
+      current = candidate;
+      currentScore = candidateScore;
+      if (currentScore === 0) break;
+    } else {
+      break;
+    }
+  }
+
+  return currentScore < originalScore ? current : null;
+}
+
+// Aplica o reparo LINHA POR LINHA em vez do arquivo inteiro de uma vez. Isso importa
+// porque um arquivo real quase sempre tem entradas em estados diferentes (algumas já
+// corretas, outras corrompidas 1x, 2x...). Reparar o arquivo inteiro como um bloco só
+// faz uma linha já correta "contaminar" a validação de UTF-8 estrito e abortar o reparo
+// de TODAS as linhas, inclusive as que realmente precisavam de conserto.
+function repairMojibakeText(fullText) {
+  const lines = fullText.split('\n');
+  let beforeTotal = 0;
+  let afterTotal = 0;
+  let anyChanged = false;
+
+  const repairedLines = lines.map(line => {
+    const before = countMojibake(line);
+    if (before === 0) return line;
+
+    beforeTotal += before;
+    const fixedLine = tryRepairMojibake(line);
+    if (fixedLine) {
+      anyChanged = true;
+      afterTotal += countMojibake(fixedLine);
+      return fixedLine;
+    }
+    afterTotal += before;
+    return line;
+  });
+
+  if (!anyChanged) return null;
+  return { text: repairedLines.join('\n'), before: beforeTotal, after: afterTotal };
+}
+
+async function executeFixMojibake(id, args) {
+  const { path: targetPath, extensions, dryRun = true, backup = true } = args;
+  if (!targetPath) return writeToolError(id, '❌ Parâmetro "path" é obrigatório.');
+
+  const safePath = validatePath(targetPath);
+  const exts = (extensions && extensions.length) ? extensions : ['.resx'];
+
+  let files;
+  try {
+    const stat = await fs.promises.stat(safePath);
+    files = stat.isDirectory() ? await collectFiles(safePath, exts, null) : [safePath];
+  } catch {
+    return writeToolError(id, `❌ Caminho não encontrado: ${targetPath}`);
+  }
+
+  const results = [];
+
+  for (const filePath of files) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+
+    const { text } = decodeBuffer(buffer);
+    const result = repairMojibakeText(text);
+    if (!result) continue;
+
+    const { text: repaired, before: beforeCount, after: afterCount } = result;
+    const diff = buildDiffPreview(text, repaired);
+
+    if (!dryRun) {
+      if (backup) await writeBackup(filePath, buffer);
+      await fs.promises.writeFile(filePath, repaired, 'utf8');
+      invalidateCachePaths(filePath);
+    }
+
+    results.push({
+      file: filePath,
+      suspiciousBefore: beforeCount,
+      suspiciousAfter: afterCount,
+      preview: diff.preview
+    });
+  }
+
+  const summary = {
+    status: 'success',
+    dryRun,
+    filesScanned: files.length,
+    filesWithMojibake: results.length,
+    results: results.slice(0, 20),
+    message: dryRun
+      ? `📋 Preview: ${results.length} arquivo(s) com mojibake detectado (de ${files.length} verificados). Use dryRun:false para corrigir.`
+      : `✅ ${results.length} arquivo(s) corrigido(s) (de ${files.length} verificados).`
+  };
+
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
 }
 
 // =============================================================================
