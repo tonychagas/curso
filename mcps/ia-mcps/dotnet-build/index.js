@@ -5,7 +5,8 @@ const fsPromises = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const readline = require('readline'); // [FIX] Importação faltante causava crash imediato
+const readline = require('readline');
+const os = require('os');
 
 /* ======================================================
    CONFIGURAÇÃO
@@ -15,17 +16,21 @@ const MCP_DIR = __dirname;
 const LOGS_DIR = path.join(MCP_DIR, 'logs');
 const HIST_PATH = path.join(MCP_DIR, 'builds.json');
 
-// Configurável via ENV para flexibilidade
 const MAX_HISTORY = parseInt(process.env.MCP_MAX_HISTORY || '5', 10);
 const BUILD_TIMEOUT_MS = parseInt(process.env.MCP_BUILD_TIMEOUT_MS || (30 * 60 * 1000).toString(), 10);
 const ACTIVE_BUILD_RETENTION_MS = parseInt(process.env.MCP_ACTIVE_BUILD_RETENTION_MS || (5 * 60 * 1000).toString(), 10);
+const MAX_CONCURRENT_BUILDS = parseInt(process.env.MCP_MAX_CONCURRENT_BUILDS || '2', 10);
 
 if (!fs.existsSync(LOGS_DIR)) {
     fs.mkdirSync(LOGS_DIR, { recursive: true });
 }
 
 const activeBuilds = {};
+const buildQueue = [];
 let historyCache = null;
+
+// Cache para referências do Roslyn
+const referenceCache = new Map();
 
 /* ======================================================
    UTILITÁRIOS
@@ -36,17 +41,14 @@ function generateTaskId() {
 }
 
 function writeResult(id, result) {
-    const response = {
-        jsonrpc: '2.0',
-        id,
-        result
-    };
-    // Garante que a escrita não falhe silenciosamente
     try {
-        process.stdout.write(JSON.stringify(response) + '\n');
+        process.stdout.write(JSON.stringify({
+            jsonrpc: '2.0',
+            id,
+            result
+        }) + '\n');
     } catch (err) {
-        console.error('[MCP Fatal] Failed to write result:', err.message);
-        process.exit(1);
+        console.error('[MCP Error] Failed to write result:', err.message);
     }
 }
 
@@ -56,15 +58,11 @@ function writeError(id, code, message) {
             JSON.stringify({
                 jsonrpc: '2.0',
                 id,
-                error: {
-                    code,
-                    message
-                }
+                error: { code, message }
             }) + '\n'
         );
     } catch (err) {
-        console.error('[MCP Fatal] Failed to write error:', err.message);
-        process.exit(1);
+        console.error('[MCP Error] Failed to write error:', err.message);
     }
 }
 
@@ -76,14 +74,11 @@ function addTail(tailBuffer, text) {
 }
 
 /* ======================================================
-   HISTÓRICO
+   HISTÓRICO E LIMPEZA DE LOGS
 ====================================================== */
 
 async function loadHistory() {
-    if (historyCache) {
-        return historyCache;
-    }
-
+    if (historyCache) return historyCache;
     try {
         if (fs.existsSync(HIST_PATH)) {
             const raw = await fsPromises.readFile(HIST_PATH, 'utf8');
@@ -92,172 +87,274 @@ async function loadHistory() {
             historyCache = {};
         }
     } catch (err) {
-        console.error('[MCP Warning] Failed to load history, starting fresh:', err.message);
+        console.error('[MCP Warning] Failed to load history:', err.message);
         historyCache = {};
     }
-
     return historyCache;
 }
 
 async function saveHistory() {
-    // [FIX] Try/Catch adicionado para evitar crash do servidor em erro de I/O
     try {
         const builds = Object.values(historyCache);
-
-        builds.sort(
-            (a, b) =>
-                new Date(b.startedAt) -
-                new Date(a.startedAt)
-        );
-
+        builds.sort((a, b) => new Date(b.startedAt) - new Date(a.startedAt));
+        
+        // Remove histórico antigo e limpa os arquivos de log do disco
         if (builds.length > MAX_HISTORY) {
             const remove = builds.slice(MAX_HISTORY);
-
             for (const build of remove) {
-                try {
-                    await fsPromises.unlink(build.logPath);
-                } catch { }
-
+                if (build.logPath && fs.existsSync(build.logPath)) {
+                    try { await fsPromises.unlink(build.logPath); } catch { }
+                }
                 delete historyCache[build.taskId];
             }
         }
-
+        
         const tmp = HIST_PATH + '.tmp';
-        
-        // Escrita atômica
-        await fsPromises.writeFile(
-            tmp,
-            JSON.stringify(historyCache, null, 2),
-            'utf8'
-        );
-        
+        await fsPromises.writeFile(tmp, JSON.stringify(historyCache, null, 2), 'utf8');
         await fsPromises.rename(tmp, HIST_PATH);
     } catch (err) {
-        console.error('[MCP Error] Critical failure saving history:', err.message);
-        // Não fazemos process.exit aqui para permitir que o servidor continue operando, 
-        // mas o histórico pode ficar dessincronizado até o próximo restart.
+        console.error('[MCP Error] Failed to save history:', err.message);
     }
 }
 
 /* ======================================================
-   LIMPEZA DE LOGS ÓRFÃOS (Startup)
+   ANÁLISE RÁPIDA COM ROSLYN (VIA ARQUIVO TEMPORÁRIO)
 ====================================================== */
 
-(async () => {
-    try {
-        const files = await fsPromises.readdir(LOGS_DIR);
-        const history = await loadHistory();
+async function getCachedReferences(projectPath) {
+    if (!projectPath) return [];
+    if (referenceCache.has(projectPath)) {
+        return referenceCache.get(projectPath);
+    }
+
+    const refs = [];
+    const projectDir = path.dirname(projectPath);
+    const binDir = path.join(projectDir, 'bin', 'Debug', 'net10.0');
+
+    if (fs.existsSync(binDir)) {
+        try {
+            const dlls = fs.readdirSync(binDir)
+                .filter(f => f.endsWith('.dll'))
+                .filter(f => {
+                    const name = path.basename(f, '.dll');
+                    return name.startsWith('Hotline') || 
+                           name.startsWith('MudBlazor') ||
+                           name.startsWith('Microsoft.') ||
+                           name.startsWith('System.') ||
+                           name.startsWith('Newtonsoft');
+                })
+                .map(f => path.join(binDir, f));
+
+            for (const dll of dlls) {
+                refs.push(dll);
+            }
+        } catch (err) {
+            console.error('[MCP Warning] Error reading bin directory:', err.message);
+        }
+    }
+
+    referenceCache.set(projectPath, refs);
+    return refs;
+}
+
+async function analyzeWithRoslyn(filePath, projectPath) {
+    let tempScriptPath = null;
+    return new Promise(async (resolve, reject) => {
+        let targetPath = filePath;
+        const ext = path.extname(filePath).toLowerCase();
         
-        const validLogs = new Set(
-            Object.values(history)
-                .map(x => path.basename(x.logPath))
-        );
-
-        // Adiciona logs de builds potencialmente ativas (se houver restart rápido)
-        // Nota: Em um crash, activeBuilds estará vazio, então confiamos no history para limpeza segura.
-
-        for (const file of files) {
-            if (!validLogs.has(file)) {
-                try {
-                    await fsPromises.unlink(
-                        path.join(LOGS_DIR, file)
-                    );
-                } catch { }
+        if (ext === '.razor' && projectPath) {
+            const projectDir = path.dirname(projectPath);
+            const fileName = path.basename(filePath);
+            
+            const candidates = [
+                path.join(projectDir, 'obj', 'Debug', 'net10.0', 'generated', 'Microsoft.NET.Sdk.Razor.SourceGenerators', 'Microsoft.NET.Sdk.Razor.SourceGenerators.RazorSourceGenerator', `${fileName}.g.cs`),
+                path.join(projectDir, 'obj', 'Debug', 'net10.0', 'Razor', 'Pages', `${fileName}.g.cs`),
+                path.join(projectDir, 'obj', 'Debug', 'net10.0', 'Razor', `${fileName}.g.cs`)
+            ];
+            
+            for (const candidate of candidates) {
+                if (fs.existsSync(candidate)) {
+                    targetPath = candidate;
+                    break;
+                }
             }
         }
-    } catch (err) {
-        console.error('[MCP Warning] Startup cleanup failed:', err.message);
-    }
-})();
 
-/* ======================================================
-   TOOL DEFINITIONS
-====================================================== */
+        const scriptContent = `
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 
-const TOOLS = [
-    {
-        name: 'start_build',
-        description: 'Inicia uma build .NET assíncrona. Retorna IMEDIATAMENTE um taskId. Use check_build para monitorar.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                solutionPath: { 
-                    type: 'string', 
-                    description: 'Caminho ABSOLUTO para .sln, .slnx, .csproj ou .fsproj.' 
-                },
-                configuration: { 
-                    type: 'string', 
-                    enum: ['Debug', 'Release'],
-                    default: 'Release',
-                    description: 'Configuração da build. Padrão: Release.'
+class RoslynAnalyzer {
+    public static void Main(string[] args) {
+        var filePath = args[0];
+        var projPath = args.Length > 1 ? args[1] : null;
+        
+        if (!File.Exists(filePath)) {
+            Console.WriteLine("[]");
+            return;
+        }
+
+        var code = File.ReadAllText(filePath);
+        var tree = CSharpSyntaxTree.ParseText(code);
+        var references = new List<MetadataReference>();
+        
+        try {
+            references.Add(MetadataReference.CreateFromFile(typeof(object).Assembly.Location));
+            references.Add(MetadataReference.CreateFromFile(typeof(Enumerable).Assembly.Location));
+        } catch {}
+
+        if (!string.IsNullOrEmpty(projPath)) {
+            var binDir = Path.Combine(Path.GetDirectoryName(projPath), "bin", "Debug", "net10.0");
+            if (Directory.Exists(binDir)) {
+                var dlls = Directory.GetFiles(binDir, "*.dll")
+                    .Where(d => {
+                        var name = Path.GetFileName(d);
+                        return name.StartsWith("Hotline") || 
+                               name.StartsWith("MudBlazor") ||
+                               name.StartsWith("Microsoft.") ||
+                               name.StartsWith("System.") ||
+                               name.StartsWith("Newtonsoft");
+                    });
+                
+                foreach (var dll in dlls) {
+                    try { 
+                        references.Add(MetadataReference.CreateFromFile(dll)); 
+                    } catch {}
                 }
-            },
-            required: ['solutionPath']
+            }
         }
-    },
-    {
-        name: 'check_build',
-        description: 'Verifica status de uma build. Retorna status, durationMs e tail do log.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                taskId: { type: 'string', description: 'ID retornado por start_build' }
-            },
-            required: ['taskId']
-        }
-    },
-    {
-        name: 'list_builds',
-        description: 'Lista as últimas builds do histórico.',
-        inputSchema: {
-            type: 'object',
-            properties: {}
-        }
-    },
-    {
-        name: 'cancel_build',
-        description: 'Cancela uma build em andamento.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                taskId: { type: 'string', description: 'ID da tarefa a cancelar' }
-            },
-            required: ['taskId']
-        }
+        
+        var compilation = CSharpCompilation.Create("TempAnalyzer")
+            .AddSyntaxTrees(tree)
+            .AddReferences(references)
+            .WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
+                .WithOptimizationLevel(OptimizationLevel.Release)
+                .WithPlatform(Platform.AnyCpu));
+        
+        var diagnostics = compilation.GetDiagnostics();
+        
+        var result = diagnostics
+            .Where(d => d.Severity == DiagnosticSeverity.Error || d.Severity == DiagnosticSeverity.Warning)
+            .Select(d => new {
+                id = d.Id,
+                severity = d.Severity.ToString(),
+                message = d.GetMessage(),
+                line = d.Location.GetLineSpan().StartLinePosition.Line + 1,
+                character = d.Location.GetLineSpan().StartLinePosition.Character + 1
+            })
+            .ToList();
+        
+        Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(result));
     }
-];
+}
+`;
+
+        try {
+            tempScriptPath = path.join(os.tmpdir(), `roslyn_analyzer_${Date.now()}.csx`);
+            await fsPromises.writeFile(tempScriptPath, scriptContent, 'utf8');
+        } catch (err) {
+            return reject(new Error(`Falha ao criar arquivo de script temporário: ${err.message}`));
+        }
+
+        const argsList = [tempScriptPath, targetPath];
+        if (projectPath) {
+            argsList.push(projectPath);
+        }
+
+        const proc = spawn('dotnet-script', argsList, { timeout: 30000 });
+        
+        let output = '', error = '';
+
+        proc.stdout.on('data', data => output += data.toString());
+        proc.stderr.on('data', data => error += data.toString());
+
+        proc.on('close', async code => {
+            if (tempScriptPath && fs.existsSync(tempScriptPath)) {
+                try { await fsPromises.unlink(tempScriptPath); } catch {}
+            }
+
+            if (code !== 0) {
+                reject(new Error(error || 'Erro inesperado na análise rápida do Roslyn'));
+            } else {
+                try {
+                    resolve(JSON.parse(output.trim() || '[]'));
+                } catch (e) {
+                    resolve([]);
+                }
+            }
+        });
+
+        proc.on('error', async err => {
+            if (tempScriptPath && fs.existsSync(tempScriptPath)) {
+                try { await fsPromises.unlink(tempScriptPath); } catch {}
+            }
+            reject(new Error(`Falha ao executar dotnet-script: ${err.message}`));
+        });
+    });
+}
 
 /* ======================================================
-   BUILD LOGIC
+   GERENCIADOR DE BUILD COM FILA DE CONCORRÊNCIA
 ====================================================== */
 
-function startBuild(id, args = {}) {
-    const {
-        solutionPath,
-        configuration = 'Release'
-    } = args;
+function processBuildQueue() {
+    const runningCount = Object.values(activeBuilds).filter(b => !b.finished).length;
+    if (runningCount < MAX_CONCURRENT_BUILDS && buildQueue.length > 0) {
+        const nextTask = buildQueue.shift();
+        executeBuild(nextTask.id, nextTask.taskId, nextTask.args, nextTask.resolvedPath, nextTask.logPath);
+    }
+}
+
+async function startBuild(id, args = {}) {
+    const { solutionPath } = args;
 
     if (!solutionPath) {
         return writeError(id, -32602, 'solutionPath obrigatório');
     }
 
-    // Normaliza caminho para evitar problemas relativos
     const resolvedPath = path.resolve(solutionPath);
-
     if (!fs.existsSync(resolvedPath)) {
         return writeError(id, -32602, 'Arquivo não encontrado');
     }
 
     const ext = path.extname(resolvedPath).toLowerCase();
     const validExtensions = ['.sln', '.slnx', '.csproj', '.fsproj'];
-
     if (!validExtensions.includes(ext)) {
         return writeError(id, -32602, 'Arquivo inválido. Use .sln, .slnx, .csproj ou .fsproj');
     }
 
     const taskId = generateTaskId();
     const logPath = path.join(LOGS_DIR, `${taskId}.log`);
-    
+
+    const runningCount = Object.values(activeBuilds).filter(b => !b.finished).length;
+
+    if (runningCount >= MAX_CONCURRENT_BUILDS) {
+        buildQueue.push({ id, taskId, args, resolvedPath, logPath });
+        writeResult(id, {
+            content: [{
+                type: 'text',
+                text: JSON.stringify({
+                    taskId,
+                    status: 'queued',
+                    message: `Limite de builds simultâneas atingido (${MAX_CONCURRENT_BUILDS}). Adicionado à fila.`
+                })
+            }],
+            structuredContent: { taskId, status: 'queued' }
+        });
+        return;
+    }
+
+    executeBuild(id, taskId, args, resolvedPath, logPath);
+}
+
+function executeBuild(id, taskId, args, resolvedPath, logPath) {
+    const { configuration = 'Release', fastMode = false, incremental = false, projects = [] } = args;
+
     let logStream;
     try {
         logStream = fs.createWriteStream(logPath);
@@ -268,23 +365,44 @@ function startBuild(id, args = {}) {
     const tailBuffer = [];
     const startTime = Date.now();
 
-    const proc = spawn(
-        'dotnet',
-        ['build', resolvedPath, '-c', configuration],
-        {
-            cwd: path.dirname(resolvedPath),
-            windowsHide: true,
-            detached: process.platform !== 'win32'
+    let buildArgs = ['build', resolvedPath, '-c', configuration];
+    
+    if (fastMode) {
+        buildArgs.push('--no-restore', '--no-incremental', '--disable-build-servers');
+    }
+    
+    if (incremental) {
+        buildArgs.push('--no-restore', '--use-current-runtime');
+    }
+    
+    if (projects && projects.length > 0) {
+        buildArgs = ['build', '-c', configuration, '--no-restore'];
+        for (const project of projects) {
+            buildArgs.push(path.resolve(project));
         }
-    );
+    }
 
-    // Registra imediatamente
+    const proc = spawn('dotnet', buildArgs, {
+        cwd: path.dirname(resolvedPath),
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+        env: {
+            ...process.env,
+            DOTNET_CLI_TELEMETRY_OPTOUT: '1',
+            DOTNET_NOLOGO: '1',
+            MSBUILDENABLEALLPROPERTYFUNCTIONS: '1'
+        }
+    });
+
     activeBuilds[taskId] = {
         proc,
         logPath,
         tailBuffer,
         startedAt: new Date().toISOString(),
-        finished: false
+        finished: false,
+        fastMode,
+        incremental,
+        projects
     };
 
     proc.stdout.on('data', data => {
@@ -300,12 +418,11 @@ function startBuild(id, args = {}) {
     });
 
     proc.on('error', err => {
-        // [FIX] Limpeza correta em caso de falha de spawn
         delete activeBuilds[taskId];
         logStream.end();
         fsPromises.unlink(logPath).catch(() => {});
-        
         writeError(id, -32603, `Falha ao iniciar dotnet: ${err.message}`);
+        processBuildQueue();
     });
 
     const timeoutHandle = setTimeout(() => {
@@ -340,17 +457,21 @@ function startBuild(id, args = {}) {
                 durationMs,
                 exitCode: code,
                 status: code === 0 ? 'succeeded' : 'failed',
-                logPath
+                logPath,
+                fastMode,
+                incremental,
+                projects
             };
             await saveHistory();
         } catch (err) {
             console.error(`[MCP Error] History save failed for ${taskId}:`, err.message);
         }
 
-        // Mantém na memória ativa por um curto período
         setTimeout(() => {
             delete activeBuilds[taskId];
         }, ACTIVE_BUILD_RETENTION_MS);
+
+        processBuildQueue();
     });
 
     writeResult(id, {
@@ -358,94 +479,77 @@ function startBuild(id, args = {}) {
             type: 'text',
             text: JSON.stringify({
                 taskId,
-                status: 'running'
+                status: 'running',
+                mode: fastMode ? 'fast' : incremental ? 'incremental' : 'full',
+                projects: projects.length > 0 ? projects : 'all'
             })
         }],
         structuredContent: {
             taskId,
-            status: 'running'
+            status: 'running',
+            mode: fastMode ? 'fast' : incremental ? 'incremental' : 'full'
         }
     });
 }
 
 /* ======================================================
-   STATUS & LOGS
+   HANDLERS AUXILIARES DE BUILD
 ====================================================== */
 
 async function checkBuild(id, args = {}) {
     const { taskId } = args;
-    const active = activeBuilds[taskId];
+    if (!taskId) {
+        return writeError(id, -32602, 'taskId obrigatório');
+    }
 
+    const active = activeBuilds[taskId];
     if (active) {
-        const currentDurationMs = Date.now() - new Date(active.startedAt).getTime();
-        
         return writeResult(id, {
-            content: [{
-                type: 'text',
-                text: JSON.stringify({
-                    status: active.finished ? 'succeeded' : 'running',
-                    durationMs: currentDurationMs,
-                    tail: active.tailBuffer.join('')
-                })
-            }],
-            structuredContent: {
-                status: active.finished ? 'succeeded' : 'running',
-                durationMs: currentDurationMs,
-                tail: active.tailBuffer.join('')
-            }
+            taskId,
+            status: active.finished ? (active.exitCode === 0 ? 'succeeded' : 'failed') : 'running',
+            durationMs: active.durationMs || (Date.now() - new Date(active.startedAt).getTime()),
+            tail: active.tailBuffer.slice(-20)
         });
     }
 
-    const history = await loadHistory();
-    const build = history[taskId];
-
-    if (!build) {
-        return writeError(id, -32602, 'Build não encontrada');
+    const inQueue = buildQueue.find(b => b.taskId === taskId);
+    if (inQueue) {
+        return writeResult(id, { taskId, status: 'queued' });
     }
 
-    writeResult(id, {
-        content: [{
-            type: 'text',
-            text: JSON.stringify(build)
-        }],
-        structuredContent: build
-    });
-}
+    const history = await loadHistory();
+    const past = history[taskId];
+    if (past) {
+        return writeResult(id, past);
+    }
 
-/* ======================================================
-   LISTAGEM & CANCELAMENTO
-====================================================== */
+    writeError(id, -32602, `Build não encontrada com taskId: ${taskId}`);
+}
 
 async function listBuilds(id) {
     const history = await loadHistory();
-    const list = Object.values(history).sort(
-        (a, b) => new Date(b.startedAt) - new Date(a.startedAt)
-    );
-
     writeResult(id, {
-        content: [{
-            type: 'text',
-            text: JSON.stringify(list, null, 2)
-        }]
+        active: Object.keys(activeBuilds),
+        queued: buildQueue.map(b => b.taskId),
+        history: Object.values(history)
     });
 }
 
 function cancelBuild(id, args = {}) {
     const { taskId } = args;
-    const build = activeBuilds[taskId];
+    if (!taskId) {
+        return writeError(id, -32602, 'taskId obrigatório');
+    }
 
-    if (!build) {
-        // Verifica se já finalizou
-        loadHistory().then(history => {
-            if (history[taskId]) {
-                writeError(id, -32602, 'Build já finalizada');
-            } else {
-                writeError(id, -32602, 'Build não encontrada');
-            }
-        }).catch(err => {
-            writeError(id, -32603, 'Erro ao verificar histórico');
-        });
-        return;
+    const queueIndex = buildQueue.findIndex(b => b.taskId === taskId);
+    if (queueIndex !== -1) {
+        buildQueue.splice(queueIndex, 1);
+        return writeResult(id, { taskId, status: 'cancelled_from_queue' });
+    }
+
+    const build = activeBuilds[taskId];
+    if (!build || build.finished) {
+        return writeError(id, -32602, 'Build não está em andamento ou não existe');
     }
 
     try {
@@ -454,21 +558,156 @@ function cancelBuild(id, args = {}) {
         } else {
             process.kill(-build.proc.pid, 'SIGKILL');
         }
-        
-        writeResult(id, {
-            content: [{
-                type: 'text',
-                text: JSON.stringify({ status: 'cancelling' })
-            }]
-        });
-
+        delete activeBuilds[taskId];
+        writeResult(id, { taskId, status: 'cancelled' });
     } catch (err) {
-        writeError(id, -32603, `Falha ao cancelar: ${err.message}`);
+        writeError(id, -32603, `Erro ao cancelar build: ${err.message}`);
     }
 }
 
 /* ======================================================
-   PROTOCOL HANDLER (STDIN)
+   HANDLER PARA analyze_file
+====================================================== */
+
+async function analyzeFile(id, args = {}) {
+    const { filePath, projectPath } = args;
+
+    if (!filePath) {
+        return writeError(id, -32602, 'filePath obrigatório');
+    }
+
+    const resolvedPath = path.resolve(filePath);
+    if (!fs.existsSync(resolvedPath)) {
+        return writeError(id, -32602, 'Arquivo não encontrado');
+    }
+
+    const ext = path.extname(resolvedPath).toLowerCase();
+    if (!['.cs', '.razor'].includes(ext)) {
+        return writeError(id, -32602, 'Apenas arquivos .cs ou .razor são suportados');
+    }
+
+    try {
+        if (projectPath && !referenceCache.has(projectPath)) {
+            await getCachedReferences(projectPath);
+        }
+
+        const startTime = Date.now();
+        const diagnostics = await analyzeWithRoslyn(resolvedPath, projectPath);
+        const durationMs = Date.now() - startTime;
+
+        writeResult(id, {
+            content: [{
+                type: 'text',
+                text: JSON.stringify({
+                    file: resolvedPath,
+                    durationMs,
+                    errors: diagnostics.filter(d => d.severity === 'Error'),
+                    warnings: diagnostics.filter(d => d.severity === 'Warning'),
+                    total: diagnostics.length
+                }, null, 2)
+            }],
+            structuredContent: {
+                file: resolvedPath,
+                durationMs,
+                errors: diagnostics.filter(d => d.severity === 'Error'),
+                warnings: diagnostics.filter(d => d.severity === 'Warning'),
+                total: diagnostics.length
+            }
+        });
+    } catch (err) {
+        writeError(id, -32603, `Erro na análise: ${err.message}`);
+    }
+}
+
+/* ======================================================
+   TOOL DEFINITIONS
+====================================================== */
+
+const TOOLS = [
+    {
+        name: 'start_build',
+        description: 'Inicia uma build .NET 10 otimizada. Pode ser rápida (fast), incremental ou completa.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                solutionPath: { 
+                    type: 'string', 
+                    description: 'Caminho ABSOLUTO para .sln, .slnx, .csproj ou .fsproj.' 
+                },
+                configuration: { 
+                    type: 'string', 
+                    enum: ['Debug', 'Release'],
+                    default: 'Release',
+                    description: 'Configuração da build.'
+                },
+                fastMode: {
+                    type: 'boolean',
+                    default: false,
+                    description: 'Modo rápido: --no-restore --no-incremental --disable-build-servers'
+                },
+                incremental: {
+                    type: 'boolean',
+                    default: false,
+                    description: 'Build incremental: --no-restore --use-current-runtime'
+                },
+                projects: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Projetos específicos para build (caminhos para .csproj). Se vazio, build toda a solução.'
+                }
+            },
+            required: ['solutionPath']
+        }
+    },
+    {
+        name: 'analyze_file',
+        description: 'ANÁLISE RÁPIDA: Usa Roslyn com cache para analisar .cs ou .razor em milissegundos (SEM BUILD).',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                filePath: { 
+                    type: 'string', 
+                    description: 'Caminho ABSOLUTO para o arquivo .cs ou .razor.' 
+                },
+                projectPath: {
+                    type: 'string',
+                    description: 'Caminho ABSOLUTO para o .csproj (recomendado para cache e dependências)'
+                }
+            },
+            required: ['filePath']
+        }
+    },
+    {
+        name: 'check_build',
+        description: 'Verifica status de uma build.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                taskId: { type: 'string', description: 'ID retornado por start_build' }
+            },
+            required: ['taskId']
+        }
+    },
+    {
+        name: 'list_builds',
+        description: 'Lista as últimas builds do histórico.',
+        inputSchema: { type: 'object', properties: {} }
+    },
+    {
+        name: 'cancel_build',
+        description: 'Cancela uma build em andamento.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                taskId: { type: 'string', description: 'ID da tarefa a cancelar' }
+            },
+            required: ['taskId']
+        }
+    }
+];
+
+/* ======================================================
+   PROTOCOL HANDLER
 ====================================================== */
 
 const rl = readline.createInterface({
@@ -493,12 +732,10 @@ rl.on('line', async line => {
     if (method === 'initialize') {
         writeResult(id, {
             protocolVersion: '2024-11-05',
-            capabilities: {
-                tools: {}
-            },
+            capabilities: { tools: {} },
             serverInfo: {
                 name: 'dotnet-build-mcp',
-                version: '1.2.1' // Versão atualizada com fixes
+                version: '2.0.0'
             }
         });
         return;
@@ -518,13 +755,16 @@ rl.on('line', async line => {
 
         switch (name) {
             case 'start_build':
-                startBuild(id, args);
+                await startBuild(id, args);
+                break;
+            case 'analyze_file':
+                await analyzeFile(id, args);
                 break;
             case 'check_build':
-                checkBuild(id, args);
+                await checkBuild(id, args);
                 break;
             case 'list_builds':
-                listBuilds(id);
+                await listBuilds(id);
                 break;
             case 'cancel_build':
                 cancelBuild(id, args);
@@ -538,13 +778,11 @@ rl.on('line', async line => {
     writeError(id, -32601, `Method not found: ${method}`);
 });
 
-// [FIX] Tratamento de erros não capturados para evitar crash silencioso
+// Tratamento de erros globais (sem encerrar o processo)
 process.on('uncaughtException', (err) => {
-    console.error('[MCP Fatal] Uncaught Exception:', err);
-    process.exit(1);
+    console.error('[MCP Error] Uncaught Exception:', err.stack || err.message);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('[MCP Fatal] Unhandled Rejection at:', promise, 'reason:', reason);
-    process.exit(1);
+    console.error('[MCP Error] Unhandled Rejection at:', promise, 'reason:', reason);
 });

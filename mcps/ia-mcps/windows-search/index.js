@@ -118,12 +118,19 @@ const TOOL_PROFILES = {
     'search_files',
     'generate_labels',
     'insert_translations',
+    'delete_translations',
+    'find_unused_translations',
+    'find_missing_loc_keys',
+    'resolve_case_duplicates',
     'get_translation_context',
     'get_existing_translations',
     'deduplicate_resx',
     'find_duplicates',
     'add_language',
     'fix_mojibake',
+    'get_file_history',
+    'analyze_i18n_health',
+    'analyze_migration_readiness',
     'compact_command',
     'undo_last_change',
     'code_outline',
@@ -232,23 +239,44 @@ function compactBuildOutput(output) {
   const errorCodes = new Set();
   const warningCodes = new Set();
 
+  // Formato padrão do MSBuild/dotnet: caminho(linha,coluna): error CSxxxx: mensagem [projeto]
+  const msbuildLineRegex = /^(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(CS\d+):\s*(.+?)(?:\s*\[.+\])?$/;
+
   for (const line of lines) {
-    const errorMatch = line.match(/error\s+(CS\d+)/);
+    const trimmed = line.trim();
+    const errorMatch = trimmed.match(/error\s+(CS\d+)/);
     if (errorMatch) {
       errorCodes.add(errorMatch[1]);
-      errors.push(line.trim());
+      errors.push(trimmed);
     }
-    const warningMatch = line.match(/warning\s+(CS\d+)/);
+    const warningMatch = trimmed.match(/warning\s+(CS\d+)/);
     if (warningMatch) {
       warningCodes.add(warningMatch[1]);
-      warnings.push(line.trim());
+      warnings.push(trimmed);
     }
   }
 
   const errorFiles = errors.map(l => {
-    const match = l.match(/([^:]+\.cs)/);
+    const match = l.match(/([^:\\/]+\.cs)/);
     return match ? match[1] : 'desconhecido';
   });
+
+  // Agrupa por arquivo+código de erro, pra ver rápido "esse arquivo tem 6x CS0103"
+  // em vez de rolar uma lista plana de 6 linhas quase idênticas.
+  const errorGroups = {};
+  for (const line of errors) {
+    const match = line.match(msbuildLineRegex);
+    if (!match) continue;
+    const [, file, lineNum, , , code, message] = match;
+    const shortFile = file.split(/[\\/]/).pop();
+    const key = `${shortFile} [${code}]`;
+    if (!errorGroups[key]) errorGroups[key] = { file: shortFile, code, count: 0, occurrences: [] };
+    errorGroups[key].count++;
+    if (errorGroups[key].occurrences.length < 5) {
+      errorGroups[key].occurrences.push({ line: Number(lineNum), message: message.trim() });
+    }
+  }
+  const groupedErrors = Object.values(errorGroups).sort((a, b) => b.count - a.count);
 
   return {
     summary: `Build: ${errors.length} erro(s), ${warnings.length} warning(s)`,
@@ -257,6 +285,7 @@ function compactBuildOutput(output) {
     errorCodes: [...errorCodes],
     warningCodes: [...warningCodes],
     errorFiles: [...new Set(errorFiles)].slice(0, 5),
+    errorGroups: groupedErrors.slice(0, 15),
     hasErrors: errors.length > 0,
     warningCount: warnings.length
   };
@@ -822,6 +851,28 @@ class SmartCache {
   }
 }
 
+// Cache de .resx já parseado (reaproveita a SmartCache/LRU já existente). Evita reparsear
+// o mesmo arquivo repetidas vezes numa sessão de tradução que consulta os 3 idiomas várias
+// vezes seguidas. Confere o mtime do arquivo em disco além do TTL: se alguém editar o .resx
+// por fora (Visual Studio, git pull, etc.) dentro da janela de 60s, o cache não serve dado velho.
+const resxCache = new SmartCache(20, 60000);
+
+async function getParsedResx(filePath) {
+  const stat = await fs.promises.stat(filePath); // deixa propagar erro se não existir
+
+  const cached = resxCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs) {
+    return cached;
+  }
+
+  const buffer = await fs.promises.readFile(filePath);
+  const { text } = decodeBuffer(buffer);
+  const keys = parseResxKeysWithValues(text);
+  const data = { text, keys, mtimeMs: stat.mtimeMs };
+  resxCache.set(filePath, data);
+  return data;
+}
+
 class DirCache {
   constructor(ttl = 5000) {
     if (MCP_CONFIG.cache) {
@@ -878,6 +929,12 @@ function invalidateCachePaths(targetPath) {
             searchCache.cache.delete(key);
         }
     }
+
+    for (const [key] of resxCache.cache) {
+        if (key.startsWith(normalized) || key === normalized) {
+            resxCache.cache.delete(key);
+        }
+    }
 }
 
 // =============================================================================
@@ -894,7 +951,15 @@ function validatePath(inputPath, baseDir = process.cwd()) {
   const resolved = path.resolve(baseDir, normalizedInput);
   const normalized = path.normalize(resolved);
   if (ALLOWED_ROOTS.length > 0) {
-    const allowed = ALLOWED_ROOTS.some(root => normalized === root || normalized.startsWith(root + path.sep));
+    // Comparação case-insensitive: NTFS/Windows não diferencia maiúscula/minúscula em
+    // caminhos, então "C:\Tony\..." e "c:\tony\..." são o MESMO arquivo de verdade —
+    // uma comparação sensível a caso podia rejeitar um caminho válido só por causa de
+    // como alguma ferramenta upstream normalizou as letras.
+    const normalizedLower = normalized.toLowerCase();
+    const allowed = ALLOWED_ROOTS.some(root => {
+      const rootLower = root.toLowerCase();
+      return normalizedLower === rootLower || normalizedLower.startsWith(rootLower + path.sep);
+    });
     if (!allowed) {
       throw new Error(`Caminho fora das pastas permitidas em .mcp-config.json (allowedRoots): ${normalized}`);
     }
@@ -1037,12 +1102,19 @@ async function handleLine(raw) {
         case 'get_cache_stats': await executeGetCacheStats(id, toolArgs); break;
         case 'generate_labels': await executeGenerateLabels(id, toolArgs); break;
         case 'insert_translations': await executeInsertTranslations(id, toolArgs); break;
+        case 'delete_translations': await executeDeleteTranslations(id, toolArgs); break;
+        case 'find_unused_translations': await executeFindUnusedTranslations(id, toolArgs); break;
+        case 'find_missing_loc_keys': await executeFindMissingLocKeys(id, toolArgs); break;
+        case 'resolve_case_duplicates': await executeResolveCaseDuplicates(id, toolArgs); break;
         case 'get_translation_context': await executeGetTranslationContext(id, toolArgs); break;
         case 'get_existing_translations': await executeGetExistingTranslations(id, toolArgs); break;
         case 'deduplicate_resx': await executeDeduplicateResx(id, toolArgs); break;
         case 'find_duplicates': await executeFindDuplicates(id, toolArgs); break;
         case 'add_language': await executeAddLanguage(id, toolArgs); break;
         case 'fix_mojibake': await executeFixMojibake(id, toolArgs); break;
+        case 'get_file_history': await executeGetFileHistory(id, toolArgs); break;
+        case 'analyze_i18n_health': await executeAnalyzeI18nHealth(id, toolArgs); break;
+        case 'analyze_migration_readiness': await executeAnalyzeMigrationReadiness(id, toolArgs); break;
         default: writeToolError(id, `Tool not found: ${toolName}`);
       }
       const duration = Date.now() - startTime;
@@ -1114,7 +1186,8 @@ const ALL_TOOL_DEFINITIONS = {
         simpleMatch: { type: 'boolean', description: 'Busca literal (não regex). Default: false' },
         caseSensitive: { type: 'boolean', description: 'Case sensitive. Default: false' },
         context: { type: 'number', description: 'Linhas de contexto (0-5). Default: 0' },
-        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' }
+        maxResults: { type: 'number', description: 'Máximo de resultados. Default: 500, máx 2000' },
+        noCache: { type: 'boolean', description: 'Ignora e não grava no cache de 10s (força busca fresca). Default: false' }
       },
       required: ['pattern', 'path']
     }
@@ -1215,12 +1288,12 @@ const ALL_TOOL_DEFINITIONS = {
   
   edit_file: {
     name: 'edit_file',
-    description: '✏️ Edita um arquivo com preview de diff antes de aplicar. Backup automático.',
+    description: '✏️ Substitui o CONTEÚDO INTEIRO de um arquivo (não é find-and-replace — não existe oldText/newText aqui). Para trocar um trecho específico sem reescrever o arquivo todo, use replace_in_files. Mostra preview de diff antes de aplicar. Backup automático.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Caminho do arquivo' },
-        content: { type: 'string', description: 'Novo conteúdo' },
+        content: { type: 'string', description: 'Conteúdo NOVO e COMPLETO do arquivo (substitui tudo, não é um patch)' },
         dryRun: { type: 'boolean', description: 'Apenas preview (default: true)' },
         backup: { type: 'boolean', description: 'Criar backup (default: true)' }
       },
@@ -1604,6 +1677,67 @@ const ALL_TOOL_DEFINITIONS = {
       required: ['path', 'translations']
     }
   },
+
+  delete_translations: {
+    name: 'delete_translations',
+    description: '🗑️ Remove chaves de todos os idiomas de uma vez (simétrico ao insert_translations). Antes de usar, confirme com find_references/get_symbol_usage que a chave não é mais referenciada em nenhum .cs/.razor — o tool não checa isso sozinho.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        keys: { type: 'array', description: 'Nomes das chaves a remover', items: { type: 'string' } },
+        languages: { type: 'array', description: 'Idiomas a processar (default: pt-BR, en-US, es-ES)', items: { type: 'string' } },
+        dryRun: { type: 'boolean', description: 'Preview. Default: true' },
+        backup: { type: 'boolean', description: 'Criar backup. Default: true' }
+      },
+      required: ['path', 'keys']
+    }
+  },
+
+  find_unused_translations: {
+    name: 'find_unused_translations',
+    description: '🔍 Acha chaves declaradas no .resx que não aparecem em nenhum .cs/.razor — candidatas a delete_translations. Varre o código uma vez só (não uma busca por chave), então funciona bem mesmo com milhares de chaves. Heurística: confira uma amostra antes de excluir de verdade.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        codePath: { type: 'string', description: 'Raiz do código a varrer, se for diferente de "path" (default: mesmo valor de path)' },
+        languages: { type: 'array', description: 'Idiomas a considerar (default: pt-BR, en-US, es-ES)', items: { type: 'string' } },
+        extensions: { type: 'array', description: 'Extensões de código a varrer (default: [".cs",".razor"])', items: { type: 'string' } }
+      },
+      required: ['path']
+    }
+  },
+
+  find_missing_loc_keys: {
+    name: 'find_missing_loc_keys',
+    description: '🔍 O inverso do find_unused_translations: acha Loc["Chave"] usado no código que não existe em NENHUM .resx — pega erro de digitação na chave e tradução esquecida (hardcode que criou a chave sem passar por generate_labels/insert_translations).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        codePath: { type: 'string', description: 'Raiz do código a varrer, se for diferente de "path" (default: mesmo valor de path)' },
+        languages: { type: 'array', description: 'Idiomas a considerar (default: pt-BR, en-US, es-ES)', items: { type: 'string' } },
+        extensions: { type: 'array', description: 'Extensões de código a varrer (default: [".cs",".razor"])', items: { type: 'string' } }
+      },
+      required: ['path']
+    }
+  },
+
+  resolve_case_duplicates: {
+    name: 'resolve_case_duplicates',
+    description: '🧹 Cruza duplicatas de chave por maiúscula/minúscula (LabelCEP vs LabelCep) com o uso real de Loc["..."] no código, pra decidir com segurança qual variante manter. Loc[...] é lookup em runtime, não checado em compilação — excluir a variante errada nunca quebra o build, só deixa de traduzir aquele texto. Só marca "seguro pra remover" quando o uso é inequívoco (exatamente 1 variante referenciada); o resto vai pra needsReview.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Diretório dos .resx' },
+        codePath: { type: 'string', description: 'Raiz do código a varrer, se for diferente de "path" (default: mesmo valor de path)' },
+        languages: { type: 'array', description: 'Idiomas a considerar (default: pt-BR, en-US, es-ES)', items: { type: 'string' } },
+        extensions: { type: 'array', description: 'Extensões de código a varrer (default: [".cs",".razor"])', items: { type: 'string' } }
+      },
+      required: ['path']
+    }
+  },
   
   get_translation_context: {
     name: 'get_translation_context',
@@ -1688,6 +1822,45 @@ const ALL_TOOL_DEFINITIONS = {
       },
       required: ['path']
     }
+  },
+
+  get_file_history: {
+    name: 'get_file_history',
+    description: '📜 Lista os backups (.bak.*) de um arquivo, mais recente primeiro — útil pra ver o histórico de alterações antes de decidir se usa undo_last_change.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Caminho do arquivo (não do backup)' }
+      },
+      required: ['path']
+    }
+  },
+
+  analyze_i18n_health: {
+    name: 'analyze_i18n_health',
+    description: '🌍 Compara as chaves entre os .resx de vários idiomas: aponta chave faltando em algum idioma e tradução vazia no idioma primário quando outros já têm valor.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Pasta com os SharedResources.<lang>.resx' },
+        languages: { type: 'array', description: 'Idiomas a comparar (default: pt-BR, en-US, es-ES)', items: { type: 'string' } },
+        primaryLanguage: { type: 'string', description: 'Idioma fonte pra checar valores vazios (default: pt-BR)' }
+      },
+      required: ['path']
+    }
+  },
+
+  analyze_migration_readiness: {
+    name: 'analyze_migration_readiness',
+    description: '🚦 Classifica arquivos .cs/.razor por criticidade pra migração Blazor Server -> Auto, baseado em assinaturas de código reais (DbContext, certificado digital, SEFAZ, HttpContext, etc.), não em interpretação do LLM. Categoria C = nunca pode virar WASM puro; A = seguro pra mover (DTO/asset); B = revisar manualmente.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Pasta raiz a analisar' },
+        extensions: { type: 'array', description: 'Extensões a verificar (default: [".cs",".razor",".css",".js"])', items: { type: 'string' } }
+      },
+      required: ['path']
+    }
   }
 };
 
@@ -1764,6 +1937,7 @@ async function executeSearchContent(id, args) {
   const caseSensitive = args.caseSensitive || false;
   const context = Math.min(args.context || 0, 5);
   const maxResults = Math.min(args.maxResults || 500, PERFORMANCE_CONFIG.maxResults);
+  const noCache = args.noCache || false;
 
   if (!pattern) {
     return writeToolError(id, '❌ Parâmetro "pattern" é obrigatório.');
@@ -1771,15 +1945,19 @@ async function executeSearchContent(id, args) {
 
   // Cache de resultado de busca (TTL curto de 10s — searchCache já existia mas nunca era usado).
   // A chave começa com o path normalizado pra invalidateCachePaths conseguir limpar em writes.
+  // noCache:true pula tanto a leitura quanto a gravação — útil pra debug quando o resultado
+  // parece "desatualizado" e você quer forçar uma varredura fresca sem esperar o TTL de 10s.
   let cacheKey = null;
-  try {
-    const normalizedForCache = path.normalize(path.resolve(searchPath));
-    cacheKey = `${normalizedForCache}|${pattern}|${fileExts || ''}|${excludeExts || ''}|${simpleMatch}|${caseSensitive}|${context}|${maxResults}`;
-    const cached = searchCache.get(cacheKey);
-    if (cached) {
-      return writeResult(id, { content: [{ type: 'text', text: `${cached}\n\n_(cache)_` }] });
-    }
-  } catch { /* se der erro montando a chave, só segue sem cache */ }
+  if (!noCache) {
+    try {
+      const normalizedForCache = path.normalize(path.resolve(searchPath));
+      cacheKey = `${normalizedForCache}|${pattern}|${fileExts || ''}|${excludeExts || ''}|${simpleMatch}|${caseSensitive}|${context}|${maxResults}`;
+      const cached = searchCache.get(cacheKey);
+      if (cached) {
+        return writeResult(id, { content: [{ type: 'text', text: `${cached}\n\n_(cache)_` }] });
+      }
+    } catch { /* se der erro montando a chave, só segue sem cache */ }
+  }
 
   try {
     const stat = await fs.promises.stat(searchPath);
@@ -2770,7 +2948,15 @@ async function executeReplaceInFiles(id, args) {
 
   let regex;
   try {
-    regex = simpleMatch ? new RegExp(escapeRegex(patternStr), caseSensitive ? 'g' : 'gi') : new RegExp(patternStr, caseSensitive ? 'g' : 'gi');
+    if (simpleMatch) {
+      // Quebra de linha real no pattern deve casar tanto \n quanto \r\n do arquivo —
+      // sem isso, um pattern multi-linha digitado com LF nunca casa num arquivo CRLF
+      // (padrão comum em projetos Windows/.NET), mesmo o texto sendo "igual" visualmente.
+      const escaped = escapeRegex(patternStr).replace(/\n/g, '\\r?\\n');
+      regex = new RegExp(escaped, caseSensitive ? 'g' : 'gi');
+    } else {
+      regex = new RegExp(patternStr, caseSensitive ? 'g' : 'gi');
+    }
   } catch (err) {
     return writeToolError(id, `❌ Regex inválida: ${err.message}`);
   }
@@ -2786,7 +2972,19 @@ async function executeReplaceInFiles(id, args) {
     }
   } catch {}
 
-  const fileList = await collectFiles(safePath, fileExts, excludeExts);
+  let fileList;
+  try {
+    const stat = await fs.promises.stat(safePath);
+    fileList = stat.isDirectory() ? await collectFiles(safePath, fileExts, excludeExts) : [safePath];
+  } catch (err) {
+    // Não esconder o erro real atrás de uma mensagem genérica -- em Windows/OneDrive
+    // (Files On-Demand, arquivo ainda sincronizando) o motivo real do stat falhar pode
+    // não ser "não existe", e sem o código/mensagem original é impossível diagnosticar.
+    return writeResult(id, {
+      content: [{ type: 'text', text: `📋 Não consegui acessar "${searchPath}": ${err.code || ''} ${err.message}` }],
+      isError: true
+    });
+  }
   if (fileList.length === 0) {
     return writeResult(id, { content: [{ type: 'text', text: `📋 Nenhum arquivo encontrado em ${searchPath}` }], isError: true });
   }
@@ -3315,8 +3513,9 @@ async function executeGetMetrics(id, args) {
 async function executeGetCacheStats(id, args) {
   const fileStats = fileCache.getStats();
   const searchStats = searchCache.getStats();
-  const totalHits = fileStats.hits + searchStats.hits;
-  const totalMisses = fileStats.misses + searchStats.misses;
+  const resxStats = resxCache.getStats();
+  const totalHits = fileStats.hits + searchStats.hits + resxStats.hits;
+  const totalMisses = fileStats.misses + searchStats.misses + resxStats.misses;
   const hitRate = totalHits + totalMisses > 0 
     ? (totalHits / (totalHits + totalMisses) * 100).toFixed(1)
     : 'N/A';
@@ -3327,6 +3526,7 @@ async function executeGetCacheStats(id, args) {
       text: JSON.stringify({
         fileCache: fileStats,
         searchCache: searchStats,
+        resxCache: resxStats,
         dirCache: { size: dirCache.cache.size },
         totalHits,
         totalMisses,
@@ -3343,8 +3543,320 @@ async function executeGetCacheStats(id, args) {
 }
 
 // =============================================================================
-// NOVAS FEATURES - find_in_project (v8.4.0)
+// GET_FILE_HISTORY — lista os backups (.bak.*) de um arquivo, mais recente primeiro.
+// Útil pra "o que mudou aqui antes de quebrar" sem precisar restaurar nada ainda.
 // =============================================================================
+
+async function executeGetFileHistory(id, args) {
+  const targetPath = args.path;
+  if (!targetPath) return writeToolError(id, '❌ Parâmetro "path" é obrigatório.');
+
+  const safePath = validatePath(targetPath);
+  const dir = path.dirname(safePath);
+  const basename = path.basename(safePath);
+
+  // Nome de backup é "<arquivo>.bak.<timestamp><contador3digitos>" (ver writeBackup).
+  // O contador é só pra evitar colisão no mesmo milissegundo — pra exibir a data de
+  // verdade, precisa descartar esses 3 dígitos finais antes de converter, senão dá
+  // uma data no futuro distante (timestamp x1000 maior do que deveria).
+  const backupPattern = new RegExp(`^${escapeRegex(basename)}\\.bak\\.(\\d+)$`);
+
+  let files;
+  try {
+    files = await fs.promises.readdir(dir);
+  } catch {
+    return writeToolError(id, `❌ Diretório não encontrado: ${dir}`);
+  }
+
+  const backups = [];
+  for (const file of files) {
+    const match = file.match(backupPattern);
+    if (!match) continue;
+    const rawTimestamp = match[1];
+    const realEpochMs = Math.floor(Number(rawTimestamp) / 1000);
+    let stat;
+    try {
+      stat = await fs.promises.stat(path.join(dir, file));
+    } catch { continue; }
+
+    backups.push({
+      path: path.join(dir, file),
+      timestamp: realEpochMs,
+      date: new Date(realEpochMs).toISOString(),
+      size: stat.size,
+      sizeHuman: formatSize(stat.size)
+    });
+  }
+
+  backups.sort((a, b) => b.timestamp - a.timestamp);
+
+  let currentSize = null;
+  try {
+    currentSize = (await fs.promises.stat(safePath)).size;
+  } catch { /* arquivo atual pode ter sido apagado/movido */ }
+
+  writeResult(id, {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        file: safePath,
+        currentSize,
+        currentSizeHuman: currentSize !== null ? formatSize(currentSize) : null,
+        totalBackups: backups.length,
+        backups: backups.slice(0, 20),
+        latest: backups[0] || null,
+        oldest: backups[backups.length - 1] || null
+      }, null, 2)
+    }]
+  });
+}
+
+
+
+// =============================================================================
+// ANALYZE_I18N_HEALTH — compara as chaves entre os idiomas de .resx e aponta
+// o que falta, o que sobrou (órfã) e traduções vazias. Usa getParsedResx, então
+// se você já rodou get_existing_translations/get_translation_context antes na
+// mesma sessão, essa chamada reaproveita o cache em vez de reparsear tudo.
+// =============================================================================
+
+async function executeAnalyzeI18nHealth(id, args) {
+  const targetPath = args.path;
+  if (!targetPath) return writeToolError(id, '❌ Parâmetro "path" é obrigatório.');
+
+  const safePath = validatePath(targetPath);
+  const langs = (args.languages && args.languages.length) ? args.languages : RESX_LANGS;
+  const primaryLang = args.primaryLanguage || 'pt-BR';
+
+  const langData = {};
+  const allKeys = new Set();
+
+  for (const lang of langs) {
+    const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
+    try {
+      const { keys } = await getParsedResx(filePath);
+      langData[lang] = { keys, count: keys.size, missing: false };
+      for (const key of keys.keys()) allKeys.add(key);
+    } catch {
+      langData[lang] = { keys: new Map(), count: 0, missing: true };
+    }
+  }
+
+  // Chaves "borked": o NOME da chave é idêntico ao VALOR de alguma outra entrada no
+  // mesmo arquivo. É a assinatura de quando um valor foi inserido como nome de chave
+  // por engano (bug que existia no insert_translations, já corrigido — mas arquivos
+  // que foram corrompidos ANTES do fix continuam com isso até serem limpos). Excluídas
+  // do cálculo de "chave faltando" abaixo, senão poluem o diagnóstico com falso positivo.
+  const borkedKeysByLang = {};
+  for (const lang of langs) {
+    const keys = langData[lang].keys;
+    const allValuesInFile = new Set();
+    for (const info of keys.values()) {
+      if (info.hasValue && info.value) allValuesInFile.add(info.value);
+    }
+    borkedKeysByLang[lang] = [...keys.keys()].filter(key => allValuesInFile.has(key));
+  }
+  const allBorkedKeys = new Set(Object.values(borkedKeysByLang).flat());
+
+  const missingKeys = [];
+  const orphanInAllButOne = [];
+  const emptyValues = [];
+
+  for (const key of allKeys) {
+    if (allBorkedKeys.has(key)) continue; // não é uma chave de verdade, é lixo do bug de insert
+
+    const present = [];
+    const missing = [];
+    for (const lang of langs) {
+      if (langData[lang].keys.has(key)) present.push(lang);
+      else missing.push(lang);
+    }
+    if (missing.length > 0 && present.length > 0) {
+      missingKeys.push({ key, present, missing });
+    }
+
+    // Vazia no idioma primário mas preenchida em pelo menos um outro -> provável tradução esquecida
+    const primaryInfo = langData[primaryLang]?.keys.get(key);
+    if (primaryInfo && primaryInfo.hasValue === false) {
+      const filledElsewhere = langs.some(lang => {
+        if (lang === primaryLang) return false;
+        const info = langData[lang].keys.get(key);
+        return info && info.hasValue && info.value.trim() !== '';
+      });
+      if (filledElsewhere) {
+        emptyValues.push({ key, emptyIn: primaryLang });
+      }
+    }
+  }
+
+  const summary = {
+    status: 'success',
+    path: safePath,
+    totalUniqueKeys: allKeys.size,
+    languages: Object.fromEntries(
+      langs.map(l => [l, { count: langData[l].count, fileMissing: langData[l].missing }])
+    ),
+    missingKeysCount: missingKeys.length,
+    missingKeys: missingKeys.slice(0, 30),
+    emptyValuesCount: emptyValues.length,
+    emptyValues: emptyValues.slice(0, 30),
+    borkedKeysCount: allBorkedKeys.size,
+    borkedKeysByLang: Object.fromEntries(Object.entries(borkedKeysByLang).filter(([, v]) => v.length > 0)),
+    health: missingKeys.length === 0 && emptyValues.length === 0 && allBorkedKeys.size === 0
+      ? '✅ Todos os idiomas sincronizados'
+      : `⚠️ ${missingKeys.length} chave(s) faltando, ${emptyValues.length} tradução(ões) vazia(s), ${allBorkedKeys.size} chave(s) "borked" (valor inserido como nome de chave — provavelmente sobra de antes do fix do insert_translations)`
+  };
+
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
+}
+
+// =============================================================================
+// ANALYZE_MIGRATION_READINESS — classifica arquivos .cs/.razor por criticidade
+// pra migração Blazor Server -> Auto, baseado em ASSINATURAS DE CÓDIGO REAIS
+// (regex), não em "achismo" do LLM. Cada classificação vem com o motivo exato
+// que a gerou, pra ser auditável — importante em código fiscal/jurídico onde
+// um erro de categorização pode significar mover algo crítico pro client.
+//
+// Categoria C (crítico): nunca pode virar Interactive WebAssembly. Precisa
+// ficar rodando no servidor (Auto cobre isso naturalmente se o componente for
+// deixado como está ou InteractiveServer — só NÃO force pra WASM).
+// Categoria A (seguro): DTO/Model/Enum puro ou asset estático — pode mover
+// pra Shared/wwwroot sem risco de lógica quebrar.
+// Categoria B (padrão/revisar): tudo que não bateu em C nem teve evidência
+// clara de A. É a categoria mais populosa de propósito — não assume "seguro"
+// sem prova.
+// =============================================================================
+
+const MIGRATION_CRITICAL_SIGNATURES = [
+  { pattern: /\w*DbContext\b/, reason: 'Acesso direto a DbContext (EF Core) — nunca roda no client' },
+  { pattern: /I?HttpContext\w*/, reason: 'Depende de HttpContext — só existe no servidor' },
+  { pattern: /\bX509Certificate2\b/, reason: 'Manipula certificado digital — nunca no client' },
+  { pattern: /\.pfx\b/i, reason: 'Referência a arquivo de certificado .pfx' },
+  { pattern: /(?:System\.IO\.)?File\.(?:ReadAll|WriteAll|Open|Exists|Delete|Copy|Move)\w*\s*\(/, reason: 'Acesso a sistema de arquivos — não existe em WASM' },
+  { pattern: /\bIWebHostEnvironment\b/, reason: 'Depende do ambiente de hospedagem do servidor' },
+  { pattern: /\[ApiController\]/, reason: 'Controller ASP.NET Core — é server-side por natureza, mesmo sem tocar DbContext/HttpContext explicitamente no corpo' },
+  { pattern: /:\s*ControllerBase\b/, reason: 'Herda de ControllerBase — Controller ASP.NET Core, server-side por natureza' },
+  { pattern: /\bCircuitHandler\b/, reason: 'API específica de Blazor Server (circuito SignalR)' },
+  { pattern: /:\s*Hub\b/, reason: 'Hub de SignalR — roda no servidor' },
+  { pattern: /\bSEFAZ/i, reason: 'Palavra-chave fiscal SEFAZ', compound: true },
+  { pattern: /certificado\s*digital/i, reason: 'Menção a certificado digital' },
+  { pattern: /\bboleto/i, reason: 'Integração bancária/pagamento (boleto)', compound: true },
+  { pattern: /\bpix/i, reason: 'Integração bancária/pagamento (Pix)', compound: true },
+  { pattern: /\bAddDbContext\b/, reason: 'Registro de DbContext no DI (Program.cs do servidor)' },
+  { pattern: /\bZeusFiscal\b|\bHercules\.NET\b/i, reason: 'Biblioteca fiscal (transmissão NF-e/SEFAZ)' }
+];
+
+const MIGRATION_MEDIUM_SIGNATURES = [
+  { pattern: /@inject\s+I\w*Service\b/i, reason: 'Injeta um serviço de aplicação — avaliar se o serviço em si é crítico' },
+  { pattern: /\bHttpClient\b/, reason: 'Já usa HttpClient — pode já estar preparado pra rodar no client' }
+];
+
+const MIGRATION_ASSET_EXT = new Set(['.css', '.js', '.png', '.jpg', '.jpeg', '.svg', '.ico', '.gif', '.woff', '.woff2', '.map']);
+
+// Testa se 'word' aparece em 'text' sozinha (fim de palavra) OU como prefixo de um
+// identificador PascalCase (ex: "SefazService", "PixService"). Não usa [A-Z] dentro
+// de regex com flag /i porque isso casaria minúscula também (case folding do JS) —
+// daria falso positivo em "pixels" tentando detectar "pix". Aqui a checagem de
+// maiúscula é feita fora do regex, sem esse problema.
+function hasCompoundWordMatch(text, wordRegex) {
+  const re = new RegExp(wordRegex.source, 'gi');
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const nextChar = text[m.index + m[0].length];
+    if (!nextChar || !/[a-z]/.test(nextChar)) return true; // fim de string, não-letra, ou maiúscula = fronteira válida
+    if (m.index === re.lastIndex) re.lastIndex++; // evita loop infinito em match vazio
+  }
+  return false;
+}
+
+function classifyMigrationFile(filePath, text) {
+  const ext = path.extname(filePath).toLowerCase();
+
+  if (MIGRATION_ASSET_EXT.has(ext)) {
+    return { category: 'A', reasons: ['Asset estático (css/js/imagem) — copiar direto pro wwwroot'] };
+  }
+
+  const clean = stripCommentsAndStrings(text);
+
+  const criticalHits = MIGRATION_CRITICAL_SIGNATURES
+    .filter(sig => sig.compound ? hasCompoundWordMatch(clean, sig.pattern) : sig.pattern.test(clean))
+    .map(sig => sig.reason);
+  if (criticalHits.length > 0) {
+    return { category: 'C', reasons: criticalHits };
+  }
+
+  const mediumHits = MIGRATION_MEDIUM_SIGNATURES.filter(sig => sig.pattern.test(clean)).map(sig => sig.reason);
+
+  // Heurística conservadora pra "seguro": só classifica A se tiver evidência
+  // (DTO puro sem método com corpo de lógica, ou .razor sem @inject/@code).
+  // Método "vazio" (só get/set) não conta como corpo de lógica.
+  const hasMethodBody = /\b(?:public|private|protected|internal)\s+(?:static\s+)?(?:async\s+)?[\w<>[\],\s]+\s+\w+\s*\([^)]*\)\s*\{(?!\s*(?:get|set)\s*;?\s*\})/i.test(clean);
+
+  if (mediumHits.length === 0) {
+    if (ext === '.cs' && !hasMethodBody) {
+      return { category: 'A', reasons: ['Parece DTO/Model/Enum — só propriedades, sem método com lógica detectado'] };
+    }
+    if (ext === '.razor') {
+      const hasInject = /@inject\b/i.test(clean);
+      const hasCode = /@code\s*\{/i.test(clean);
+      if (!hasInject && !hasCode) {
+        return { category: 'A', reasons: ['Componente .razor sem @inject e sem @code — UI pura'] };
+      }
+    }
+  }
+
+  return {
+    category: 'B',
+    reasons: mediumHits.length ? mediumHits : ['Não bateu em assinatura crítica nem em critério claro de "seguro" — revisar manualmente']
+  };
+}
+
+async function executeAnalyzeMigrationReadiness(id, args) {
+  const targetPath = args.path;
+  if (!targetPath) return writeToolError(id, '❌ Parâmetro "path" é obrigatório.');
+
+  const safePath = validatePath(targetPath);
+  const extensions = (args.extensions && args.extensions.length) ? args.extensions : ['.cs', '.razor', '.css', '.js'];
+
+  let files;
+  try {
+    files = await collectFiles(safePath, extensions, null);
+  } catch {
+    return writeToolError(id, `❌ Caminho não encontrado: ${targetPath}`);
+  }
+
+  const byCategory = { A: [], B: [], C: [] };
+  const errors = [];
+
+  await runPool(files, PERFORMANCE_CONFIG.concurrency, async (filePath) => {
+    try {
+      const ext = path.extname(filePath).toLowerCase();
+      let text = '';
+      if (!MIGRATION_ASSET_EXT.has(ext)) {
+        const buffer = await fs.promises.readFile(filePath);
+        text = decodeBuffer(buffer).text;
+      }
+      const result = classifyMigrationFile(filePath, text);
+      byCategory[result.category].push({ file: filePath, reasons: result.reasons });
+    } catch (err) {
+      errors.push({ file: filePath, error: err.message });
+    }
+  });
+
+  const summary = {
+    status: 'success',
+    path: safePath,
+    totalFiles: files.length,
+    counts: { A_seguro: byCategory.A.length, B_revisar: byCategory.B.length, C_critico: byCategory.C.length },
+    loteA_seguro: byCategory.A.map(x => x.file).slice(0, 300),
+    loteB_revisar: byCategory.B.slice(0, 300),
+    loteC_critico: byCategory.C, // nunca trunca — é o lote que exige atenção total
+    errors: errors.slice(0, 20),
+    note: 'Classificação heurística baseada em assinaturas de código conhecidas, não em interpretação do LLM. LOTE C deve ser revisado item a item; confira uma amostra do LOTE A antes de confiar 100%. Blast radius (quem usa cada símbolo) fica por conta de find_references/get_symbol_usage.'
+  };
+
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
+}
 
 async function executeFindInProject(id, args) {
   const pattern = args.pattern;
@@ -5265,12 +5777,34 @@ function findDuplicateKeysWithPositions(text) {
       total += positions.length - 1;
     }
   }
+
+  // Duplicatas por diferença de maiúscula/minúscula (ex: LabelCEP vs LabelCep) — só DETECÇÃO.
+  // Diferente de duplicata exata, aqui não dá pra saber automaticamente qual variante é a
+  // "certa" (pode haver código C# referenciando cada uma das duas), então isso não remove
+  // nada sozinho — só reporta pra revisão manual, idealmente cruzando com find_references.
+  const byLowerCase = new Map();
+  for (const key of keyPositions.keys()) {
+    const lower = key.toLowerCase();
+    if (!byLowerCase.has(lower)) byLowerCase.set(lower, []);
+    byLowerCase.get(lower).push(key);
+  }
+  const caseInsensitiveDuplicates = [];
+  for (const [lower, variants] of byLowerCase) {
+    if (variants.length > 1) {
+      caseInsensitiveDuplicates.push({
+        variants,
+        positions: variants.map(v => ({ key: v, lines: keyPositions.get(v) }))
+      });
+    }
+  }
   
   return { 
     duplicates: duplicateEntries,
     totalDuplicateOccurrences: total,
     duplicateKeys: duplicateEntries.map(d => d.key),
-    hasDuplicates: duplicateEntries.length > 0
+    hasDuplicates: duplicateEntries.length > 0,
+    caseInsensitiveDuplicates,
+    hasCaseInsensitiveDuplicates: caseInsensitiveDuplicates.length > 0
   };
 }
 
@@ -5278,7 +5812,15 @@ function findDuplicateKeysWithPositions(text) {
 async function executeDeduplicateResx(id, args) {
   const { path: targetPath, dryRun = true, backup = true, keepFirst = true } = args;
   const safePath = validatePath(targetPath);
-  const files = await collectFiles(safePath, ['.resx'], null);
+
+  let files;
+  try {
+    const stat = await fs.promises.stat(safePath);
+    files = stat.isDirectory() ? await collectFiles(safePath, ['.resx'], null) : [safePath];
+  } catch {
+    return writeToolError(id, `❌ Caminho não encontrado: ${targetPath}`);
+  }
+
   const results = [];
   let totalRemoved = 0;
   
@@ -5287,8 +5829,9 @@ async function executeDeduplicateResx(id, args) {
     try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
     const { text } = decodeBuffer(buffer);
     
-    // ✅ Validar se é um .resx válido
-    if (!text.includes('<root>') || !text.includes('</root>')) {
+    // Validar se é um .resx válido — aceita <root> com ou sem atributos/namespaces
+    // (o ResXResourceWriter do Visual Studio normalmente gera <root xmlns:...>, não <root> puro)
+    if (!/<root[\s>]/.test(text) || !text.includes('</root>')) {
       results.push({ file: filePath, error: 'Arquivo .resx inválido (não contém <root>)' });
       continue;
     }
@@ -5448,9 +5991,8 @@ async function executeGenerateLabels(id, args) {
   for (const lang of RESX_LANGS) {
     const filePath = path.join(resxBase, `SharedResources.${lang}.resx`);
     try {
-      const buffer = await fs.promises.readFile(filePath);
-      const { text } = decodeBuffer(buffer);
-      resxData[lang] = { exists: true, keys: parseResxKeysWithValues(text), text, filePath };
+      const parsed = await getParsedResx(filePath);
+      resxData[lang] = { exists: true, keys: parsed.keys, text: parsed.text, filePath };
     } catch {
       resxData[lang] = { exists: false, keys: new Map(), text: '', filePath };
     }
@@ -5557,8 +6099,16 @@ async function executeInsertTranslations(id, args) {
       for (const [key, value] of Object.entries(valueMap)) {
         const escapedKey = escapeXml(key);
         const escapedValue = escapeXml(value);
-        const regex = new RegExp(`<data name="${escapedKey}"[^>]*>\\s*<value>([^<]*)<\\/value>`, 'g');
-        newContent = newContent.replace(regex, (match, currentVal) => match.replace(currentVal, escapedValue));
+        // IMPORTANTE: escapedKey aqui precisa ser escapado pra REGEX também (escapeXml só
+        // escapa &<>"', não . ( ) [ ] etc.), senão uma chave com esses caracteres quebra o regex.
+        const regexSafeKey = escapeRegex(escapedKey);
+        // Grupos de captura em vez de match.replace(currentVal, ...): o placeholder criado por
+        // buildResxEntries tem <value> IGUAL ao name (name="KEY"><value>KEY</value>), então a
+        // string da chave aparece duas vezes no trecho casado. match.replace(texto, ...) troca
+        // sempre a PRIMEIRA ocorrência — que é o name, não o value — trocando chave por valor.
+        // Com grupos de captura não tem essa ambiguidade: cada pedaço só é usado uma vez.
+        const regex = new RegExp(`(<data name="${regexSafeKey}"[^>]*>\\s*<value>)([^<]*)(<\\/value>)`, 'g');
+        newContent = newContent.replace(regex, (match, before, currentVal, after) => `${before}${escapedValue}${after}`);
       }
     }
 
@@ -5582,6 +6132,357 @@ async function executeInsertTranslations(id, args) {
       }, null, 2)
     }]
   });
+}
+
+// =============================================================================
+// DELETE_TRANSLATIONS — remove chaves em lote de todos os idiomas de uma vez.
+// Simétrico ao insert_translations: em vez de precisar ler o .resx inteiro e
+// reescrever via edit_file (caro em token pra arquivo grande), passa só a
+// lista de chaves a remover e o tool localiza/remove o bloco <data> de cada
+// uma, preservando o resto do arquivo intacto.
+// =============================================================================
+
+async function executeDeleteTranslations(id, args) {
+  const { path: targetPath, keys, languages, dryRun = true, backup = true } = args;
+  if (!keys || !Array.isArray(keys) || keys.length === 0) {
+    return writeToolError(id, '❌ "keys" (array com os nomes das chaves) é obrigatório.');
+  }
+
+  const safePath = validatePath(targetPath);
+  const langs = (languages && languages.length) ? languages : RESX_LANGS;
+  const keysSet = new Set(keys);
+
+  const results = [];
+  let totalRemoved = 0;
+
+  for (const lang of langs) {
+    const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+
+    const { text } = decodeBuffer(buffer);
+    const hasCRLF = text.includes('\r\n');
+    const eol = hasCRLF ? '\r\n' : '\n';
+    const lines = text.split(/\r\n|\n/);
+
+    const removedKeys = [];
+    const outputLines = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      const match = line.match(/<data\s+name="([^"]*)"/);
+      const key = match ? unescapeXml(match[1]) : null;
+
+      if (key && keysSet.has(key)) {
+        removedKeys.push(key);
+        // Pula até (e incluindo) a linha de fechamento </data> desse bloco
+        while (i < lines.length && !lines[i].includes('</data>')) i++;
+        i++;
+        continue;
+      }
+      outputLines.push(line);
+      i++;
+    }
+
+    const notFoundKeys = keys.filter(k => !removedKeys.includes(k));
+
+    if (removedKeys.length === 0) {
+      results.push({ lang, status: 'no_changes', notFoundKeys });
+      continue;
+    }
+
+    const newContent = outputLines.join(eol);
+    totalRemoved += removedKeys.length;
+
+    if (!dryRun) {
+      if (backup) await writeBackup(filePath, buffer);
+      await fs.promises.writeFile(filePath, newContent, 'utf8');
+      invalidateCachePaths(filePath);
+    }
+
+    results.push({
+      lang,
+      status: dryRun ? 'preview' : 'removed',
+      removedKeys,
+      notFoundKeys,
+      count: removedKeys.length
+    });
+  }
+
+  const summary = {
+    status: 'success',
+    dryRun,
+    totalRemoved,
+    results,
+    message: dryRun
+      ? `📋 Preview: ${totalRemoved} chave(s) seriam removidas. Use dryRun:false para aplicar.`
+      : `✅ ${totalRemoved} chave(s) removida(s) em ${results.filter(r => r.status === 'removed').length} arquivo(s).`
+  };
+
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
+}
+
+// =============================================================================
+// FIND_UNUSED_TRANSLATIONS — chaves declaradas no .resx mas que não aparecem
+// em nenhum .cs/.razor. Varre o código UMA VEZ construindo um Set de tokens
+// (em vez de uma busca por chave, que seria O(chaves × arquivos) e caro em
+// tempo/token) e depois só confere cada chave contra esse Set — O(arquivos)
+// + O(chaves).
+// =============================================================================
+
+async function executeFindUnusedTranslations(id, args) {
+  const targetPath = args.path;
+  if (!targetPath) return writeToolError(id, '❌ Parâmetro "path" é obrigatório.');
+
+  const safePath = validatePath(targetPath);
+  const langs = (args.languages && args.languages.length) ? args.languages : RESX_LANGS;
+  const codeExtensions = (args.extensions && args.extensions.length) ? args.extensions : ['.cs', '.razor'];
+  // Por padrão assume que o código fica na mesma árvore do .resx. Se o seu .resx estiver
+  // numa pasta separada (ex: "Resources/") e o código em outra, passe codePath apontando
+  // pra raiz do projeto.
+  const codeRoot = args.codePath ? validatePath(args.codePath) : safePath;
+
+  const allKeys = new Set();
+  for (const lang of langs) {
+    const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
+    try {
+      const { keys } = await getParsedResx(filePath);
+      for (const key of keys.keys()) allKeys.add(key);
+    } catch { /* idioma pode não existir, tudo bem */ }
+  }
+  if (allKeys.size === 0) {
+    return writeToolError(id, `❌ Nenhuma chave encontrada em ${safePath} pros idiomas ${langs.join(', ')}.`);
+  }
+
+  let files;
+  try {
+    files = await collectFiles(codeRoot, codeExtensions, null);
+  } catch {
+    return writeToolError(id, `❌ Caminho de código não encontrado: ${args.codePath || targetPath}`);
+  }
+
+  const wordTokens = new Set();
+  const locIndexerKeys = new Set();
+
+  for (const filePath of files) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+    const { text } = decodeBuffer(buffer);
+
+    LOC_KEY_REGEX.lastIndex = 0;
+    let m;
+    while ((m = LOC_KEY_REGEX.exec(text)) !== null) {
+      locIndexerKeys.add(m[1]);
+    }
+
+    // Checagem ampla e propositalmente permissiva: qualquer identificador de palavra
+    // inteira no arquivo. Cobre acesso fortemente tipado (SharedResources.Key),
+    // GetString("Key"), nameof(Key), etc. — o objetivo é NUNCA marcar uma chave como
+    // "não usada" por engano; prefere errar pro lado de "achou uso demais".
+    const tokens = text.match(/[A-Za-z_][A-Za-z0-9_]*/g);
+    if (tokens) for (const t of tokens) wordTokens.add(t);
+  }
+
+  const unusedKeys = [];
+  const usedViaLoc = [];
+  const usedViaFallbackOnly = [];
+
+  for (const key of allKeys) {
+    if (locIndexerKeys.has(key)) {
+      usedViaLoc.push(key);
+    } else if (wordTokens.has(key)) {
+      usedViaFallbackOnly.push(key);
+    } else {
+      unusedKeys.push(key);
+    }
+  }
+
+  const summary = {
+    status: 'success',
+    totalKeys: allKeys.size,
+    filesScanned: files.length,
+    usedViaLocCount: usedViaLoc.length,
+    usedViaFallbackOnlyCount: usedViaFallbackOnly.length,
+    usedViaFallbackOnly: usedViaFallbackOnly.slice(0, 50),
+    unusedCount: unusedKeys.length,
+    unusedKeys: unusedKeys.sort(),
+    warning: '⚠️ Heurística, não garantia: uma chave "não usada" ainda pode ser referenciada dinamicamente (string montada em runtime, config, nome vindo de banco). "usedViaFallbackOnly" merece uma olhada — foi achada como palavra solta no código, não via Loc[...], então pode ser coincidência de nome. Confira uma amostra com find_references/search_content antes de mandar pro delete_translations, principalmente em telas fiscais/jurídicas.'
+  };
+
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
+}
+
+// =============================================================================
+// FIND_MISSING_LOC_KEYS — o inverso do anterior: Loc["Chave"] usado no código
+// mas que não existe em NENHUM dos .resx. Pega tanto erro de digitação na
+// chave quanto "esqueci de gerar a tradução" quanto hardcode que criou a
+// própria chave sem passar pelo fluxo normal (generate_labels/insert_translations).
+// =============================================================================
+
+async function executeFindMissingLocKeys(id, args) {
+  const targetPath = args.path;
+  if (!targetPath) return writeToolError(id, '❌ Parâmetro "path" é obrigatório.');
+
+  const safePath = validatePath(targetPath);
+  const langs = (args.languages && args.languages.length) ? args.languages : RESX_LANGS;
+  const codeExtensions = (args.extensions && args.extensions.length) ? args.extensions : ['.cs', '.razor'];
+  const codeRoot = args.codePath ? validatePath(args.codePath) : safePath;
+
+  const declaredKeys = new Set();
+  for (const lang of langs) {
+    const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
+    try {
+      const { keys } = await getParsedResx(filePath);
+      for (const key of keys.keys()) declaredKeys.add(key);
+    } catch { /* idioma pode não existir, tudo bem */ }
+  }
+
+  let files;
+  try {
+    files = await collectFiles(codeRoot, codeExtensions, null);
+  } catch {
+    return writeToolError(id, `❌ Caminho de código não encontrado: ${args.codePath || targetPath}`);
+  }
+
+  // key -> [{file, line}] (guarda só a primeira ocorrência de cada arquivo, pra não
+  // inchar a resposta se a mesma chave-fantasma aparecer 10x no mesmo arquivo)
+  const usageByKey = new Map();
+
+  for (const filePath of files) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+    const { text } = decodeBuffer(buffer);
+    const lines = text.split(/\r\n|\n/);
+
+    LOC_KEY_REGEX.lastIndex = 0;
+    let m;
+    while ((m = LOC_KEY_REGEX.exec(text)) !== null) {
+      const key = m[1];
+      if (declaredKeys.has(key)) continue;
+      if (!key || !key.trim()) continue; // Loc[""] ou Loc[variavel] não é uma chave hardcoded de verdade
+
+      if (!usageByKey.has(key)) usageByKey.set(key, []);
+      const occurrences = usageByKey.get(key);
+      if (occurrences.some(o => o.file === filePath)) continue;
+
+      // Acha a linha aproximada procurando o texto da chave
+      let lineNum = null;
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes(`"${key}"`)) { lineNum = i + 1; break; }
+      }
+      occurrences.push({ file: filePath, line: lineNum });
+    }
+  }
+
+  const missingKeys = [...usageByKey.entries()]
+    .map(([key, occurrences]) => ({ key, occurrenceCount: occurrences.length, occurrences: occurrences.slice(0, 5) }))
+    .sort((a, b) => b.occurrenceCount - a.occurrenceCount);
+
+  const summary = {
+    status: 'success',
+    filesScanned: files.length,
+    declaredKeysCount: declaredKeys.size,
+    missingKeysCount: missingKeys.length,
+    missingKeys: missingKeys.slice(0, 100),
+    suggestion: missingKeys.length > 0
+      ? '💡 Cada uma dessas é um Loc["..."] usado no código sem chave correspondente em nenhum .resx. Pode ser erro de digitação (comparar com chaves parecidas já existentes) ou tradução esquecida (rodar generate_labels/insert_translations pra criar).'
+      : '✅ Todo Loc["..."] usado no código tem chave correspondente em pelo menos um idioma.'
+  };
+
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
+}
+
+// =============================================================================
+// RESOLVE_CASE_DUPLICATES — cruza as duplicatas por maiúscula/minúscula (achadas
+// por find_duplicates) com o uso real de Loc["..."] no código. Loc[...] é um
+// lookup de dicionário em runtime, não checado em compilação, então excluir a
+// variante errada NUNCA quebra o build — na pior hipótese, aquela tela específica
+// para de traduzir aquele texto (visível, não silencioso). Isso muda o cálculo
+// de risco: dá pra decidir automaticamente quando o uso é inequívoco.
+// =============================================================================
+
+async function executeResolveCaseDuplicates(id, args) {
+  const targetPath = args.path;
+  if (!targetPath) return writeToolError(id, '❌ Parâmetro "path" é obrigatório.');
+
+  const safePath = validatePath(targetPath);
+  const langs = (args.languages && args.languages.length) ? args.languages : RESX_LANGS;
+  const codeExtensions = (args.extensions && args.extensions.length) ? args.extensions : ['.cs', '.razor'];
+  const codeRoot = args.codePath ? validatePath(args.codePath) : safePath;
+
+  // 1. Junta as chaves de todos os idiomas e agrupa por lowercase
+  const allKeys = new Set();
+  for (const lang of langs) {
+    const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
+    try {
+      const { keys } = await getParsedResx(filePath);
+      for (const key of keys.keys()) allKeys.add(key);
+    } catch {}
+  }
+
+  const byLowerCase = new Map();
+  for (const key of allKeys) {
+    const lower = key.toLowerCase();
+    if (!byLowerCase.has(lower)) byLowerCase.set(lower, []);
+    byLowerCase.get(lower).push(key);
+  }
+  const groups = [...byLowerCase.values()].filter(variants => variants.length > 1);
+
+  if (groups.length === 0) {
+    return writeResult(id, { content: [{ type: 'text', text: JSON.stringify({ status: 'success', groupsFound: 0, message: '✅ Nenhuma duplicata por maiúscula/minúscula encontrada.' }, null, 2) }] });
+  }
+
+  // 2. Varre o código UMA VEZ coletando exatamente quais Loc["..."] são usados
+  // (case-sensitive, igual o C# trata em runtime)
+  let files;
+  try {
+    files = await collectFiles(codeRoot, codeExtensions, null);
+  } catch {
+    return writeToolError(id, `❌ Caminho de código não encontrado: ${args.codePath || targetPath}`);
+  }
+
+  const usedKeys = new Set();
+  for (const filePath of files) {
+    let buffer;
+    try { buffer = await fs.promises.readFile(filePath); } catch { continue; }
+    const { text } = decodeBuffer(buffer);
+    LOC_KEY_REGEX.lastIndex = 0;
+    let m;
+    while ((m = LOC_KEY_REGEX.exec(text)) !== null) usedKeys.add(m[1]);
+  }
+
+  // 3. Pra cada grupo, decide com base no uso real
+  const safeToClean = [];   // exatamente 1 variante usada -> as outras são seguras de remover
+  const needsReview = [];   // 2+ variantes usadas (inconsistência real no código) OU nenhuma usada
+  let totalSafeToRemove = 0;
+
+  for (const variants of groups) {
+    const usedVariants = variants.filter(v => usedKeys.has(v));
+    if (usedVariants.length === 1) {
+      const toRemove = variants.filter(v => v !== usedVariants[0]);
+      safeToClean.push({ keep: usedVariants[0], remove: toRemove, reason: 'só essa variante é referenciada via Loc[...] no código' });
+      totalSafeToRemove += toRemove.length;
+    } else if (usedVariants.length === 0) {
+      needsReview.push({ variants, reason: 'nenhuma variante usada via Loc[...] — podem ser todas mortas, ou usadas de outro jeito (acesso tipado, dinâmico). Revisar antes de decidir.' });
+    } else {
+      needsReview.push({ variants, usedVariants, reason: '⚠️ MAIS DE UMA variante é usada no código — é uma inconsistência real, não dá pra resolver sozinho. Alguém referenciou os dois casings em lugares diferentes.' });
+    }
+  }
+
+  const summary = {
+    status: 'success',
+    groupsFound: groups.length,
+    safeToCleanCount: safeToClean.length,
+    totalKeysSafeToRemove: totalSafeToRemove,
+    safeToClean,
+    needsReviewCount: needsReview.length,
+    needsReview,
+    nextStep: safeToClean.length > 0
+      ? `💡 Pra aplicar: delete_translations com keys:[${safeToClean.flatMap(g => g.remove).map(k => `"${k}"`).join(', ')}], dryRun:true primeiro.`
+      : null
+  };
+
+  writeResult(id, { content: [{ type: 'text', text: JSON.stringify(summary, null, 2) }] });
 }
 
 async function executeGetTranslationContext(id, args) {
@@ -5611,9 +6512,7 @@ async function executeGetExistingTranslations(id, args) {
   for (const lang of langs) {
     const filePath = path.join(safePath, `SharedResources.${lang}.resx`);
     try {
-      const buffer = await fs.promises.readFile(filePath);
-      const { text } = decodeBuffer(buffer);
-      const keys = parseResxKeysWithValues(text);
+      const { keys } = await getParsedResx(filePath);
       translations[lang] = {};
       for (const [key, info] of keys) {
         if (specificKeys && !specificKeys.includes(key)) continue;
@@ -5688,15 +6587,31 @@ function removeDuplicates(text, keepFirst = true) {
 async function executeFindDuplicates(id, args) {
   const { path: targetPath } = args;
   const safePath = validatePath(targetPath);
-  const files = await collectFiles(safePath, ['.resx'], null);
+
+  let files;
+  try {
+    const stat = await fs.promises.stat(safePath);
+    files = stat.isDirectory() ? await collectFiles(safePath, ['.resx'], null) : [safePath];
+  } catch {
+    return writeToolError(id, `❌ Caminho não encontrado: ${targetPath}`);
+  }
+
   const results = [];
   for (const filePath of files) {
     try {
       const buffer = await fs.promises.readFile(filePath);
       const { text } = decodeBuffer(buffer);
       const dupInfo = findDuplicateKeysWithPositions(text);
-      if (dupInfo.duplicates.length > 0) {
-        results.push({ file: filePath, duplicates: dupInfo.duplicates, count: dupInfo.totalDuplicateOccurrences });
+      if (dupInfo.duplicates.length > 0 || dupInfo.hasCaseInsensitiveDuplicates) {
+        results.push({
+          file: filePath,
+          duplicates: dupInfo.duplicates,
+          count: dupInfo.totalDuplicateOccurrences,
+          caseInsensitiveDuplicates: dupInfo.caseInsensitiveDuplicates,
+          note: dupInfo.hasCaseInsensitiveDuplicates
+            ? '⚠️ Há chaves que só diferem em maiúscula/minúscula (ex: LabelCEP vs LabelCep) — revisar manualmente qual variante manter, idealmente checando find_references de cada uma antes de decidir.'
+            : undefined
+        });
       }
     } catch {}
   }
@@ -5954,8 +6869,11 @@ hasRipgrep().then(available => {
   if (available) {
     console.error('✅ Ripgrep disponível - search_content será SUPER RÁPIDO!');
   } else {
-    console.error('⚠️ Ripgrep não encontrado - search_content usará fallback (mais lento)');
-    console.error('💡 Instale ripgrep: https://github.com/BurntSushi/ripgrep');
+    console.error('⚠️ Ripgrep não encontrado - search_content usará fallback em JS (mais lento em pastas grandes)');
+    console.error('💡 Instale com um destes comandos (escolha o que já tiver disponível):');
+    console.error('   winget install BurntSushi.ripgrep.MSVC');
+    console.error('   choco install ripgrep');
+    console.error('   scoop install ripgrep');
   }
 }).catch(() => {});
 
